@@ -38,42 +38,51 @@ jobs:
           AD=$(oci iam availability-domain list --query "data[0].name" --raw-output)
           echo "AD: $AD"
 
-          # Déjà une instance vivante ? on ne recrée pas.
+          # Quelles instances Always Free a-t-on déjà (vivantes) ?
           EXISTING=$(oci compute instance list -c "$COMPARTMENT" --all \
             --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].\"display-name\"" \
             --raw-output 2>/dev/null)
-          if echo "$EXISTING" | grep -qE 'amd-vm|arm-vm'; then
-            echo "Instance déjà présente -> rien à faire."
+          HAS_AMD=0; HAS_ARM=0
+          echo "$EXISTING" | grep -q 'amd-vm' && HAS_AMD=1
+          echo "$EXISTING" | grep -q 'arm-vm' && HAS_ARM=1
+          echo "Déjà présent -> AMD: $HAS_AMD | ARM: $HAS_ARM"
+
+          # Objectif = avoir l'ARM 24 GB. Si on l'a déjà, plus rien à chasser.
+          if [ "$HAS_ARM" = "1" ]; then
+            echo "ARM déjà présente -> objectif atteint, rien à faire."
             exit 0
           fi
 
-          IMG_X86=$(oci compute image list -c "$COMPARTMENT" \
-            --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
-            --shape "VM.Standard.E2.1.Micro" --sort-by TIMECREATED \
-            --query "data[0].id" --raw-output)
           IMG_ARM=$(oci compute image list -c "$COMPARTMENT" \
             --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
             --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
             --query "data[0].id" --raw-output)
 
-          # --- Essai AMD (E2.1.Micro : pas de shape-config) ---
-          OUT=$(oci compute instance launch \
-            --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
-            --shape "VM.Standard.E2.1.Micro" --image-id "$IMG_X86" \
-            --subnet-id "$SUBNET" --assign-public-ip true --display-name "amd-vm" \
-            --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
-          if echo "$OUT" | grep -q '"id"'; then
-            echo "WHICH=AMD" >> "$GITHUB_ENV"; echo "GOT=1" >> "$GITHUB_ENV"
-            echo "✅ AMD créée"; exit 0
+          # --- Essai AMD seulement si on ne l'a pas encore (sinon on garde la nôtre) ---
+          if [ "$HAS_AMD" = "0" ]; then
+            IMG_X86=$(oci compute image list -c "$COMPARTMENT" \
+              --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
+              --shape "VM.Standard.E2.1.Micro" --sort-by TIMECREATED \
+              --query "data[0].id" --raw-output)
+            OUT=$(oci compute instance launch \
+              --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
+              --shape "VM.Standard.E2.1.Micro" --image-id "$IMG_X86" \
+              --subnet-id "$SUBNET" --assign-public-ip true --display-name "amd-vm" \
+              --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
+            if echo "$OUT" | grep -q '"id"'; then
+              echo "WHICH=AMD" >> "$GITHUB_ENV"; echo "GOT=1" >> "$GITHUB_ENV"
+              echo "✅ AMD créée"
+            else
+              echo "AMD -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
+            fi
+            sleep 30
           fi
-          echo "AMD -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
 
-          sleep 30
-
-          # --- Essai ARM (A1.Flex : 1 OCPU / 6 GB) ---
+          # --- Essai ARM (A1.Flex : 2 OCPU / 12 GB ; large pour les scrapers,
+          #     se grab plus vite que 4/24, et garde 2 OCPU/12 GB libres pour un futur site) ---
           OUT=$(oci compute instance launch \
             --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
-            --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus": 1, "memoryInGBs": 6}' \
+            --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
             --image-id "$IMG_ARM" --subnet-id "$SUBNET" --assign-public-ip true \
             --display-name "arm-vm" \
             --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
@@ -89,5 +98,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
             --title "✅ Instance OCI créée ($WHICH) — récupère l'IP" \
             --body "Une slot $WHICH s'est libérée dans eu-paris-1, l'instance est créée. Va dans la console OCI > Compute > Instances pour l'IP publique, puis connecte-toi : ssh -i ~/.ssh/main-vm ubuntu@IP_PUBLIQUE. Désactive ensuite ce workflow (onglet Actions > OCI capacity grabber > ... > Disable)."
