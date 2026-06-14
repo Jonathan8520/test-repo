@@ -53,10 +53,13 @@ jobs:
             --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
             --query "data[0].id" --raw-output)
 
-          # --- Essai ARM (A1.Flex : 4 OCPU / 24 GB = tout le quota Always Free, une seule grosse VM) ---
+          # --- Essai ARM (A1.Flex : 2 OCPU / 12 GB = le MAX gratuit en 24/7).
+          #     Le free tier A1 est mesuré en heures : 1500 OCPU-h + 9000 GB-h / mois,
+          #     soit ~2 OCPU / 12 GB allumés non-stop. Une VM 4/24 tournant 24/7
+          #     dépasserait ces heures et serait FACTURÉE. ---
           OUT=$(oci compute instance launch \
             --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
-            --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus": 4, "memoryInGBs": 24}' \
+            --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
             --image-id "$IMG_ARM" --subnet-id "$SUBNET" --assign-public-ip true \
             --display-name "arm-vm" \
             --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
