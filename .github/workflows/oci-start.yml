@@ -2,10 +2,9 @@ name: OCI start (retry until capacity)
 
 # Rallume amd-vm quand un créneau de capacité Always Free se libère à Paris.
 #
-# SILENCIEUX : le job n'échoue PAS quand la seule cause est un manque de
-# capacité (sinon GitHub enverrait un mail d'échec à chaque run planifié).
-# Il ouvre une issue (= mail) UNIQUEMENT au succès. Il n'échoue que sur une
-# vraie erreur inattendue (auth, mauvais OCID…).
+# SILENCIEUX & ROBUSTE : retente sur TOUT échec transitoire (manque de capacité,
+# rate-limit/TooManyRequests, timeout réseau…) sans jamais faire échouer le job.
+# Ouvre une issue (= mail) UNIQUEMENT au succès. Aucun mail d'échec.
 #
 # À DÉSACTIVER une fois l'instance RUNNING (Actions > ce workflow > … > Disable).
 
@@ -36,13 +35,13 @@ jobs:
       OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
       OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      GH_TOKEN:            ${{ secrets.GITHUB_TOKEN }}
       DEFAULT_ID:          "ocid1.instance.oc1.eu-paris-1.anrwiljr4qgaapycfz6bk4rz5cpg7of7rlju6uzghyf2s3akxewp35pkmnqq"
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Start (silencieux si manque de capacité)
-        id: start
+      - name: Start (retente sur tout échec transitoire, silencieux)
         run: |
           ID="${{ github.event.inputs.instance_id }}"
           [ -z "$ID" ] && ID="$DEFAULT_ID"
@@ -57,36 +56,22 @@ jobs:
             exit 0
           fi
 
-          # ~12 tentatives espacées de 30 s (~6 min). Le cron relance toutes
-          # les 10 min, inutile de faire une longue boucle par run.
+          # ~12 tentatives espacées de 30 s (~6 min). Le cron relance toutes les
+          # 10 min. On retente sur TOUT échec (capacité, rate-limit, timeout).
           for i in $(seq 1 12); do
             OUT=$(oci compute instance action --instance-id "$ID" \
               --action START --wait-for-state RUNNING --max-wait-seconds 120 2>&1)
             if [ $? -eq 0 ]; then
               echo "✅ Instance RUNNING (tentative $i)."
-              echo "started=1" >> "$GITHUB_OUTPUT"
+              gh issue create --repo "$GITHUB_REPOSITORY" \
+                --title "✅ amd-vm redémarrée (capacité retrouvée)" \
+                --body "amd-vm est repassée en RUNNING. Récupère l'IP publique (elle a pu changer) dans la console OCI > Compute > Instances, puis DÉSACTIVE le workflow 'OCI start (retry until capacity)' (Actions > … > Disable) pour stopper les tentatives planifiées."
               exit 0
             fi
-            if echo "$OUT" | grep -qi 'out of host capacity'; then
-              echo "Tentative $i : pas de capacité, nouvel essai dans 30 s…"
-              sleep 30
-            else
-              # Erreur inattendue : là, on VEUT être alerté (job en échec).
-              echo "❌ Erreur inattendue :"
-              echo "$OUT"
-              exit 1
-            fi
+            REASON=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|timed out|timeout|connection|429|internalerror|throttl' | head -1)
+            [ -z "$REASON" ] && REASON="échec transitoire"
+            echo "Tentative $i : $REASON — nouvel essai dans 30 s…"
+            sleep 30
           done
-          # Toujours pas de capacité : sortie en SUCCÈS pour ne pas spammer.
-          echo "Pas de capacité pour l'instant — le prochain run planifié réessaiera. (silencieux)"
+          echo "Pas rallumée cette fois — le prochain run planifié réessaiera. (silencieux)"
           exit 0
-
-      - name: Notifie (issue) quand l'instance repart
-        if: steps.start.outputs.started == '1'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh issue create \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "✅ amd-vm redémarrée (capacité retrouvée)" \
-            --body "amd-vm est repassée en RUNNING. Récupère l'IP publique (elle a pu changer) dans la console OCI > Compute > Instances, puis DÉSACTIVE le workflow 'OCI start (retry until capacity)' (onglet Actions > … > Disable) pour stopper les tentatives planifiées."
