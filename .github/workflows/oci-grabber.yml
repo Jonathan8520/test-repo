@@ -1,18 +1,22 @@
 name: OCI capacity grabber
 
-# À chaque run (~toutes les 11 min), tente de COMPLÉTER le quota Always Free :
-#   - une 2e VM AMD (E2.1.Micro, 1 OCPU / 1 Go)              -> "amd-vm-2"
-#   - la prochaine tranche ARM (A1.Flex, 1 OCPU / 6 Go)      -> "arm-vm-1" .. "arm-vm-4"
+# À chaque run (~toutes les 11 min), COMPLÈTE le quota Always Free en créant la
+# prochaine machine manquante, dès qu'un créneau de capacité se libère :
+#   - 2e VM AMD  : E2.1.Micro, 1 OCPU / 1 Go          -> "amd-vm-2"
+#   - VM ARM     : liste-cible FIXE (petites d'abord) :
+#         arm-vm-1 = 1 OCPU / 6 Go
+#         arm-vm-2 = 1 OCPU / 6 Go
+#         arm-vm-3 = 2 OCPU / 12 Go
+#     Somme ARM = 4 OCPU / 24 Go = EXACTEMENT le max gratuit.
 #
-# Stratégie "petites tranches" : 4 tranches de 1 OCPU/6 Go = 4 OCPU / 24 Go, soit
-# EXACTEMENT le maximum gratuit ARM. Une petite tranche rentre bien plus souvent
-# dans un trou de capacité qu'une grosse 4/24 -> on décroche plus vite.
+# SÉCURITÉ ANTI-FACTURATION (double garde-fou) :
+#   1) ne crée une cible que si aucune instance de ce nom n'existe déjà
+#      (et uniquement si le comptage renvoie EXACTEMENT 0 -> en cas de doute, on saute) ;
+#   2) backstop : ne lance une tranche ARM que si OCPU ARM utilisés + tranche <= 4.
+# La somme de la liste-cible valant pile 4/24, on ne peut pas dépasser.
 #
-# SÉCURITÉ : plafonné à 2 AMD + 4 ARM. Si le comptage échoue, on considère le
-# quota "plein" et on ne crée rien -> aucun risque de dépassement / facturation.
-# Ne fait QUE créer ce qui manque ; ne touche jamais aux instances existantes.
+# Ne fait QUE créer ; ne touche jamais aux instances existantes.
 # (amd-vm, la 1re, est rallumée à part par oci-start.yml.)
-#
 # Ouvre une issue (= mail) à chaque création. À DÉSACTIVER quand le quota est plein.
 
 on:
@@ -44,36 +48,24 @@ jobs:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Compléter le quota (2e AMD + ARM par tranches de 1/6)
+      - name: Compléter le quota (2e AMD + ARM selon liste-cible fixe)
         run: |
           set +e
           AD=$(oci iam availability-domain list --query "data[0].name" --raw-output)
           echo "AD : $AD"
 
-          # --- Compte l'existant (hors instances terminées) ---
-          AMD_N=$(oci compute instance list -c "$COMPARTMENT" --all \
-            --query "length(data[?\"shape\"=='VM.Standard.E2.1.Micro' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
-            --raw-output 2>/dev/null)
-          ARM_N=$(oci compute instance list -c "$COMPARTMENT" --all \
-            --query "length(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
-            --raw-output 2>/dev/null)
-          # Garde-fous anti-dépassement : si un comptage échoue, on plafonne.
-          case "$AMD_N" in ''|*[!0-9]*) AMD_N=2 ;; esac
-          case "$ARM_N" in ''|*[!0-9]*) ARM_N=4 ;; esac
-          echo "État quota : AMD=$AMD_N/2  ARM=$ARM_N/4"
-
-          if [ "$AMD_N" -ge 2 ] && [ "$ARM_N" -ge 4 ]; then
-            echo "✅ Quota Always Free plein — rien à créer. (pense à désactiver ce workflow)"
-            exit 0
-          fi
-
           notify() {
             gh issue create --repo "$GITHUB_REPOSITORY" \
               --title "✅ $1 créée sur OCI" \
-              --body "Le grabber a créé **$1**. Récupère son IP publique dans la console OCI > Compute > Instances, puis connecte-toi : ssh -i ~/.ssh/main-vm ubuntu@IP_PUBLIQUE. Objectif de quota : 2 AMD + 4 ARM (1 OCPU/6 Go chacune). Désactive ce workflow quand tout est plein."
+              --body "Le grabber a créé **$1**. Récupère son IP publique dans la console OCI > Compute > Instances, puis connecte-toi : ssh -i ~/.ssh/main-vm ubuntu@IP_PUBLIQUE. Désactive ce workflow quand ton quota est plein."
           }
 
-          # --- 2e VM AMD ---
+          # ===== 2e VM AMD (E2.1.Micro, 1 OCPU / 1 Go) =====
+          AMD_N=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query "length(data[?\"shape\"=='VM.Standard.E2.1.Micro' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+            --raw-output 2>/dev/null)
+          case "$AMD_N" in ''|*[!0-9]*) AMD_N=2 ;; esac
+          echo "AMD : $AMD_N/2"
           if [ "$AMD_N" -lt 2 ]; then
             IMG=$(oci compute image list -c "$COMPARTMENT" \
               --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
@@ -86,30 +78,54 @@ jobs:
               --display-name "amd-vm-2" \
               --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
             if echo "$OUT" | grep -q '"id"'; then
-              echo "✅ amd-vm-2 créée"
-              notify "amd-vm-2"
+              echo "✅ amd-vm-2 créée"; notify "amd-vm-2"
             else
               echo "AMD-2 -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
             fi
           fi
 
-          # --- Prochaine tranche ARM (1 OCPU / 6 Go) ---
-          if [ "$ARM_N" -lt 4 ]; then
-            NEXT=$((ARM_N + 1))
-            IMG=$(oci compute image list -c "$COMPARTMENT" \
-              --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
-              --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
-              --query "data[0].id" --raw-output)
+          # ===== ARM : liste-cible fixe (somme = 4 OCPU / 24 Go) =====
+          IMG_ARM=$(oci compute image list -c "$COMPARTMENT" \
+            --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
+            --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
+            --query "data[0].id" --raw-output)
+
+          # OCPU ARM déjà utilisés (backstop anti-dépassement)
+          ARM_COUNT=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query "length(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+            --raw-output 2>/dev/null)
+          if [ "$ARM_COUNT" = "0" ]; then
+            USED=0
+          else
+            USED=$(oci compute instance list -c "$COMPARTMENT" --all \
+              --query "sum(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].\"shape-config\".ocpus)" \
+              --raw-output 2>/dev/null)
+          fi
+          case "$USED" in ''|*[!0-9.]*) USED=4 ;; esac
+          echo "ARM : $USED/4 OCPU utilisés"
+
+          # nom ocpus mem — on crée la 1re cible manquante (petites d'abord),
+          # une seule tentative ARM par run (doux pour le rate-limit).
+          printf '%s\n' "arm-vm-1 1 6" "arm-vm-2 1 6" "arm-vm-3 2 12" | while read NAME OCPU MEM; do
+            EX=$(oci compute instance list -c "$COMPARTMENT" --all \
+              --query "length(data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+              --raw-output 2>/dev/null)
+            [ "$EX" != "0" ] && continue          # existe déjà (ou doute) -> cible suivante
+            if ! awk -v u="$USED" -v t="$OCPU" 'BEGIN{exit !(u+t<=4)}'; then
+              echo "Backstop : $NAME (+$OCPU OCPU) dépasserait 4 -> saut"
+              continue
+            fi
+            echo "Cible manquante : $NAME ($OCPU OCPU / $MEM Go) — tentative…"
             OUT=$(oci compute instance launch \
               --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
-              --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus": 1, "memoryInGBs": 6}' \
-              --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
-              --display-name "arm-vm-$NEXT" \
+              --shape "VM.Standard.A1.Flex" --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $MEM}" \
+              --image-id "$IMG_ARM" --subnet-id "$SUBNET" --assign-public-ip true \
+              --display-name "$NAME" \
               --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
             if echo "$OUT" | grep -q '"id"'; then
-              echo "✅ arm-vm-$NEXT créée (1 OCPU / 6 Go)"
-              notify "arm-vm-$NEXT"
+              echo "✅ $NAME créée ($OCPU OCPU / $MEM Go)"; notify "$NAME"
             else
-              echo "ARM -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
+              echo "$NAME -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
             fi
-          fi
+            break
+          done
