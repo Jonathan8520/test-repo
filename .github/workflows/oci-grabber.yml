@@ -9,6 +9,9 @@ name: OCI capacity grabber
 #         arm-vm-3 = 2 OCPU / 12 Go
 #     Somme ARM = 4 OCPU / 24 Go = EXACTEMENT le max gratuit.
 #
+# ANTI-BRIDAGE : une pause sépare la tentative AMD de la tentative ARM pour
+# éviter le TooManyRequests (appels trop rapprochés sur le tenancy).
+#
 # SÉCURITÉ ANTI-FACTURATION (double garde-fou) :
 #   1) ne crée une cible que si aucune instance de ce nom n'existe déjà
 #      (et uniquement si le comptage renvoie EXACTEMENT 0 -> en cas de doute, on saute) ;
@@ -83,6 +86,10 @@ jobs:
               echo "AMD-2 -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
             fi
           fi
+
+          # Pause anti-bridage : laisse retomber le compteur d'appels avant l'ARM.
+          echo "Pause anti-bridage (30 s)…"
+          sleep 30
 
           # ===== ARM : liste-cible fixe (somme = 4 OCPU / 24 Go) =====
           IMG_ARM=$(oci compute image list -c "$COMPARTMENT" \
