@@ -1,0 +1,68 @@
+name: OCI reboot migration
+
+# Déplace une instance signalée en maintenance par Oracle vers du matériel sain.
+#
+# Contexte : Oracle a détecté que l'infrastructure sous-jacente de l'instance
+# est instable (REF COMPUTE-10B, n° d49df561) et va la déplacer sous 24 h dans
+# la fenêtre de maintenance. On peut prendre les devants en la redémarrant.
+#
+# IMPORTANT : un reboot déclenché DEPUIS l'OS invité ne déplace PAS l'instance.
+# Seul un reboot passé par le plan de contrôle OCI (ci-dessous) réalise la
+# "reboot migration" vers du matériel sain. Cela provoque une courte coupure,
+# donc ce workflow est MANUEL uniquement (bouton "Run workflow").
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: "OCID de l'instance à redémarrer/migrer"
+        required: true
+        default: "ocid1.instance.oc1.eu-paris-1.anrwiljr4qgaapycfz6bk4rz5cpg7of7rlju6uzghyf2s3akxewp35pkmnqq"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-reboot-migrate
+  cancel-in-progress: false
+
+jobs:
+  reboot-migrate:
+    runs-on: ubuntu-latest
+    env:
+      OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      INSTANCE_ID:         ${{ github.event.inputs.instance_id }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: État actuel + infos de maintenance
+        run: |
+          set -e
+          echo "Instance : $INSTANCE_ID"
+          oci compute instance get --instance-id "$INSTANCE_ID" \
+            --query 'data.{name:"display-name", state:"lifecycle-state", maintenanceRebootDue:"time-maintenance-reboot-due"}' \
+            --output table
+
+      - name: Reboot migration (SOFTRESET via plan de contrôle)
+        run: |
+          set -e
+          # SOFTRESET = arrêt propre de l'OS puis redémarrage, orchestré par OCI.
+          # Quand une maintenance est en attente, ce reboot déplace l'instance
+          # vers du matériel sain. --wait-for-state bloque jusqu'au retour en RUNNING.
+          oci compute instance action \
+            --instance-id "$INSTANCE_ID" \
+            --action SOFTRESET \
+            --wait-for-state RUNNING
+
+      - name: État après migration
+        run: |
+          set -e
+          oci compute instance get --instance-id "$INSTANCE_ID" \
+            --query 'data.{name:"display-name", state:"lifecycle-state", maintenanceRebootDue:"time-maintenance-reboot-due"}' \
+            --output table
+          echo "✅ Reboot terminé. Si 'maintenanceRebootDue' est désormais vide/null, la migration a réussi."
