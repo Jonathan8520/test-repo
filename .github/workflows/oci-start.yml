@@ -1,14 +1,13 @@
 name: OCI start (retry until capacity)
 
-# Rallume une instance ARRÊTÉE en retentant tant qu'Oracle répond
-# "Out of host capacity" (capacité Always Free rare à Paris).
+# Rallume amd-vm quand un créneau de capacité Always Free se libère à Paris.
 #
-# Contexte : après un stop/start de migration, amd-vm s'est retrouvée STOPPED
-# et n'a pas pu redémarrer faute de capacité AMD libre. Ce workflow boucle sur
-# l'action START jusqu'à décrocher un créneau, puis ouvre une issue (= mail).
+# SILENCIEUX : le job n'échoue PAS quand la seule cause est un manque de
+# capacité (sinon GitHub enverrait un mail d'échec à chaque run planifié).
+# Il ouvre une issue (= mail) UNIQUEMENT au succès. Il n'échoue que sur une
+# vraie erreur inattendue (auth, mauvais OCID…).
 #
-# Manuel + planifié (toutes les 10 min) en filet de sécurité. À DÉSACTIVER une
-# fois l'instance RUNNING (onglet Actions > ce workflow > ... > Disable).
+# À DÉSACTIVER une fois l'instance RUNNING (Actions > ce workflow > … > Disable).
 
 on:
   workflow_dispatch:
@@ -30,7 +29,7 @@ concurrency:
 jobs:
   start:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 12
     env:
       OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
@@ -42,10 +41,9 @@ jobs:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Start avec retries sur "Out of host capacity"
+      - name: Start (silencieux si manque de capacité)
         id: start
         run: |
-          # ID depuis l'input manuel, sinon la valeur par défaut (runs planifiés).
           ID="${{ github.event.inputs.instance_id }}"
           [ -z "$ID" ] && ID="$DEFAULT_ID"
           echo "Instance : $ID"
@@ -56,13 +54,12 @@ jobs:
           echo "État initial : $STATE"
           if [ "$STATE" = "RUNNING" ]; then
             echo "Déjà RUNNING — rien à faire."
-            echo "already=1" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # ~40 tentatives espacées de 35 s (~23 min), en plus de l'attente
-          # jusqu'à RUNNING quand l'action passe.
-          for i in $(seq 1 40); do
+          # ~12 tentatives espacées de 30 s (~6 min). Le cron relance toutes
+          # les 10 min, inutile de faire une longue boucle par run.
+          for i in $(seq 1 12); do
             OUT=$(oci compute instance action --instance-id "$ID" \
               --action START --wait-for-state RUNNING --max-wait-seconds 120 2>&1)
             if [ $? -eq 0 ]; then
@@ -71,16 +68,18 @@ jobs:
               exit 0
             fi
             if echo "$OUT" | grep -qi 'out of host capacity'; then
-              echo "Tentative $i : pas de capacité, nouvel essai dans 35 s…"
-              sleep 35
+              echo "Tentative $i : pas de capacité, nouvel essai dans 30 s…"
+              sleep 30
             else
-              echo "Erreur non liée à la capacité :"
+              # Erreur inattendue : là, on VEUT être alerté (job en échec).
+              echo "❌ Erreur inattendue :"
               echo "$OUT"
               exit 1
             fi
           done
-          echo "Toujours pas de capacité après 40 tentatives."
-          exit 1
+          # Toujours pas de capacité : sortie en SUCCÈS pour ne pas spammer.
+          echo "Pas de capacité pour l'instant — le prochain run planifié réessaiera. (silencieux)"
+          exit 0
 
       - name: Notifie (issue) quand l'instance repart
         if: steps.start.outputs.started == '1'
@@ -90,4 +89,4 @@ jobs:
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "✅ amd-vm redémarrée (capacité retrouvée)" \
-            --body "amd-vm est repassée en RUNNING après l'incident de capacité. Récupère l'IP publique (elle a pu changer) dans la console OCI > Compute > Instances, puis pense à DÉSACTIVER le workflow 'OCI start (retry until capacity)' pour arrêter les tentatives planifiées."
+            --body "amd-vm est repassée en RUNNING. Récupère l'IP publique (elle a pu changer) dans la console OCI > Compute > Instances, puis DÉSACTIVE le workflow 'OCI start (retry until capacity)' (onglet Actions > … > Disable) pour stopper les tentatives planifiées."
