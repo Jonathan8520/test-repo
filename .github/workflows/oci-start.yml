@@ -6,6 +6,9 @@ name: OCI start (retry until capacity)
 # rate-limit/TooManyRequests, timeout réseau…) sans jamais faire échouer le job.
 # Ouvre une issue (= mail) UNIQUEMENT au succès. Aucun mail d'échec.
 #
+# APPELS ESPACÉS : ~6 tentatives toutes les 90 s (au lieu de 12 × 30 s) pour ne
+# pas saturer le quota d'appels du tenancy et laisser le grabber (ARM) respirer.
+#
 # À DÉSACTIVER une fois l'instance RUNNING (Actions > ce workflow > … > Disable).
 
 on:
@@ -56,9 +59,9 @@ jobs:
             exit 0
           fi
 
-          # ~12 tentatives espacées de 30 s (~6 min). Le cron relance toutes les
+          # ~6 tentatives espacées de 90 s (~9 min). Le cron relance toutes les
           # 10 min. On retente sur TOUT échec (capacité, rate-limit, timeout).
-          for i in $(seq 1 12); do
+          for i in $(seq 1 6); do
             OUT=$(oci compute instance action --instance-id "$ID" \
               --action START --wait-for-state RUNNING --max-wait-seconds 120 2>&1)
             if [ $? -eq 0 ]; then
@@ -70,8 +73,8 @@ jobs:
             fi
             REASON=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|timed out|timeout|connection|429|internalerror|throttl' | head -1)
             [ -z "$REASON" ] && REASON="échec transitoire"
-            echo "Tentative $i : $REASON — nouvel essai dans 30 s…"
-            sleep 30
+            echo "Tentative $i : $REASON — nouvel essai dans 90 s…"
+            sleep 90
           done
           echo "Pas rallumée cette fois — le prochain run planifié réessaiera. (silencieux)"
           exit 0
