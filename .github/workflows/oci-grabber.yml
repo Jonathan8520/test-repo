@@ -1,13 +1,24 @@
 name: OCI capacity grabber
 
-# Tente de créer une instance Always Free (AMD puis ARM) toutes les ~11 min.
-# Dès qu'une slot se libère, l'instance est créée et une issue GitHub est
-# ouverte (= tu reçois un mail). Pense à désactiver le workflow ensuite.
+# À chaque run (~toutes les 11 min), tente de COMPLÉTER le quota Always Free :
+#   - une 2e VM AMD (E2.1.Micro, 1 OCPU / 1 Go)              -> "amd-vm-2"
+#   - la prochaine tranche ARM (A1.Flex, 1 OCPU / 6 Go)      -> "arm-vm-1" .. "arm-vm-4"
+#
+# Stratégie "petites tranches" : 4 tranches de 1 OCPU/6 Go = 4 OCPU / 24 Go, soit
+# EXACTEMENT le maximum gratuit ARM. Une petite tranche rentre bien plus souvent
+# dans un trou de capacité qu'une grosse 4/24 -> on décroche plus vite.
+#
+# SÉCURITÉ : plafonné à 2 AMD + 4 ARM. Si le comptage échoue, on considère le
+# quota "plein" et on ne crée rien -> aucun risque de dépassement / facturation.
+# Ne fait QUE créer ce qui manque ; ne touche jamais aux instances existantes.
+# (amd-vm, la 1re, est rallumée à part par oci-start.yml.)
+#
+# Ouvre une issue (= mail) à chaque création. À DÉSACTIVER quand le quota est plein.
 
 on:
   schedule:
-    - cron: '*/11 * * * *'   # GitHub peut retarder/grouper : sans importance ici
-  workflow_dispatch:          # bouton "Run workflow" pour tester à la main
+    - cron: '*/11 * * * *'
+  workflow_dispatch:
 
 permissions:
   issues: write
@@ -28,53 +39,77 @@ jobs:
       COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
       SUBNET:              ${{ secrets.OCI_SUBNET }}
       SSH_PUBKEY:          ${{ secrets.OCI_SSH_PUBKEY }}
+      GH_TOKEN:            ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Try to grab an instance
+      - name: Compléter le quota (2e AMD + ARM par tranches de 1/6)
         run: |
           set +e
           AD=$(oci iam availability-domain list --query "data[0].name" --raw-output)
-          echo "AD: $AD"
+          echo "AD : $AD"
 
-          # ARM déjà créée ? alors objectif atteint, on ne fait rien.
-          # (L'amd-vm déjà obtenue est un quota Always Free séparé : on n'y touche plus.)
-          EXISTING=$(oci compute instance list -c "$COMPARTMENT" --all \
-            --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].\"display-name\"" \
+          # --- Compte l'existant (hors instances terminées) ---
+          AMD_N=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query "length(data[?\"shape\"=='VM.Standard.E2.1.Micro' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
             --raw-output 2>/dev/null)
-          if echo "$EXISTING" | grep -q 'arm-vm'; then
-            echo "ARM déjà présente -> objectif atteint, rien à faire."
+          ARM_N=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query "length(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+            --raw-output 2>/dev/null)
+          # Garde-fous anti-dépassement : si un comptage échoue, on plafonne.
+          case "$AMD_N" in ''|*[!0-9]*) AMD_N=2 ;; esac
+          case "$ARM_N" in ''|*[!0-9]*) ARM_N=4 ;; esac
+          echo "État quota : AMD=$AMD_N/2  ARM=$ARM_N/4"
+
+          if [ "$AMD_N" -ge 2 ] && [ "$ARM_N" -ge 4 ]; then
+            echo "✅ Quota Always Free plein — rien à créer. (pense à désactiver ce workflow)"
             exit 0
           fi
 
-          IMG_ARM=$(oci compute image list -c "$COMPARTMENT" \
-            --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
-            --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
-            --query "data[0].id" --raw-output)
+          notify() {
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "✅ $1 créée sur OCI" \
+              --body "Le grabber a créé **$1**. Récupère son IP publique dans la console OCI > Compute > Instances, puis connecte-toi : ssh -i ~/.ssh/main-vm ubuntu@IP_PUBLIQUE. Objectif de quota : 2 AMD + 4 ARM (1 OCPU/6 Go chacune). Désactive ce workflow quand tout est plein."
+          }
 
-          # --- Essai ARM (A1.Flex : 2 OCPU / 12 GB = le MAX gratuit en 24/7).
-          #     Le free tier A1 est mesuré en heures : 1500 OCPU-h + 9000 GB-h / mois,
-          #     soit ~2 OCPU / 12 GB allumés non-stop. Une VM 4/24 tournant 24/7
-          #     dépasserait ces heures et serait FACTURÉE. ---
-          OUT=$(oci compute instance launch \
-            --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
-            --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
-            --image-id "$IMG_ARM" --subnet-id "$SUBNET" --assign-public-ip true \
-            --display-name "arm-vm" \
-            --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
-          if echo "$OUT" | grep -q '"id"'; then
-            echo "WHICH=ARM" >> "$GITHUB_ENV"; echo "GOT=1" >> "$GITHUB_ENV"
-            echo "✅ ARM créée"; exit 0
+          # --- 2e VM AMD ---
+          if [ "$AMD_N" -lt 2 ]; then
+            IMG=$(oci compute image list -c "$COMPARTMENT" \
+              --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
+              --shape "VM.Standard.E2.1.Micro" --sort-by TIMECREATED \
+              --query "data[0].id" --raw-output)
+            OUT=$(oci compute instance launch \
+              --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
+              --shape "VM.Standard.E2.1.Micro" \
+              --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
+              --display-name "amd-vm-2" \
+              --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
+            if echo "$OUT" | grep -q '"id"'; then
+              echo "✅ amd-vm-2 créée"
+              notify "amd-vm-2"
+            else
+              echo "AMD-2 -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
+            fi
           fi
-          echo "ARM -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
 
-      - name: Notify on success
-        if: env.GOT == '1'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh issue create \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "✅ Instance OCI créée ($WHICH) — récupère l'IP" \
-            --body "Une slot $WHICH s'est libérée dans eu-paris-1, l'instance est créée. Va dans la console OCI > Compute > Instances pour l'IP publique, puis connecte-toi : ssh -i ~/.ssh/main-vm ubuntu@IP_PUBLIQUE. Désactive ensuite ce workflow (onglet Actions > OCI capacity grabber > ... > Disable)."
+          # --- Prochaine tranche ARM (1 OCPU / 6 Go) ---
+          if [ "$ARM_N" -lt 4 ]; then
+            NEXT=$((ARM_N + 1))
+            IMG=$(oci compute image list -c "$COMPARTMENT" \
+              --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
+              --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
+              --query "data[0].id" --raw-output)
+            OUT=$(oci compute instance launch \
+              --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
+              --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus": 1, "memoryInGBs": 6}' \
+              --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
+              --display-name "arm-vm-$NEXT" \
+              --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
+            if echo "$OUT" | grep -q '"id"'; then
+              echo "✅ arm-vm-$NEXT créée (1 OCPU / 6 Go)"
+              notify "arm-vm-$NEXT"
+            else
+              echo "ARM -> $(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)"
+            fi
+          fi
