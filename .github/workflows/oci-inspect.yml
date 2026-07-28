@@ -37,6 +37,7 @@ jobs:
       - name: Inventaire des instances
         run: |
           set +e
+          echo "=== INVENTAIRE ==="
           oci compute instance list -c "$COMPARTMENT" --all \
             --query 'data[?"lifecycle-state"!=`TERMINATED`].{name:"display-name", shape:"shape", state:"lifecycle-state", ocpus:"shape-config".ocpus, memGB:"shape-config"."memory-in-gbs"}' \
             --output table
@@ -52,7 +53,7 @@ jobs:
           echo "Envoi de la commande a l'agent…"
           OUT=$(oci instance-agent command create \
             --compartment-id "$COMPARTMENT" \
-            --execution-time-out-in-seconds 120 \
+            --timeout-in-seconds 120 \
             --target "$TARGET" \
             --content "$CONTENT" 2>&1)
 
