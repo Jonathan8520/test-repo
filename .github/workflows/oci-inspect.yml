@@ -1,11 +1,12 @@
 name: OCI inspect (etat + contenu VM)
 
-# 1) Liste toutes les instances du compartiment.
-# 2) Execute une commande LECTURE SEULE dans amd-vm via "Run Command" de
-#    l'agent Oracle (aucun SSH) et affiche le resultat.
+# 1) Liste les instances du compartiment.
+# 2) Active le plugin "Compute Instance Run Command" sur l'instance (API).
+# 3) Execute une commande LECTURE SEULE dans la VM via l'agent Oracle (sans SSH).
 #
-# La commande executee est de l'inspection pure : uname, RAM, disque, uptime,
-# services actifs, contenu de /home. Elle n'installe et ne modifie RIEN.
+# La commande est de l'inspection pure : uname, RAM, disque, uptime, services,
+# contenu de /home. Elle n'installe et ne modifie RIEN sur la VM.
+# L'activation du plugin ne redemarre pas l'instance.
 
 on:
   workflow_dispatch:
@@ -21,7 +22,7 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
@@ -42,6 +43,17 @@ jobs:
             --query 'data[?"lifecycle-state"!=`TERMINATED`].{name:"display-name", shape:"shape", state:"lifecycle-state", ocpus:"shape-config".ocpus, memGB:"shape-config"."memory-in-gbs"}' \
             --output table
 
+      - name: Activer le plugin Run Command
+        run: |
+          set +e
+          AGENT=$(jq -nc '{areAllPluginsDisabled:false, isManagementDisabled:false, isMonitoringDisabled:false, pluginsConfig:[{name:"Compute Instance Run Command", desiredState:"ENABLED"}]}')
+          echo "Activation du plugin…"
+          oci compute instance update --instance-id "$INSTANCE_ID" \
+            --agent-config "$AGENT" --force \
+            --query 'data."agent-config"' --output json 2>&1 | head -30
+          echo "Attente de la prise en compte par l'agent (90 s)…"
+          sleep 90
+
       - name: Run Command - inspection lecture seule
         run: |
           set +e
@@ -59,13 +71,13 @@ jobs:
 
           CMD_ID=$(echo "$OUT" | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4)
           if [ -z "$CMD_ID" ]; then
-            echo "❌ Creation impossible. Reponse :"
+            echo "❌ Creation impossible :"
             echo "$OUT" | head -40
             exit 0
           fi
           echo "Command ID : $CMD_ID"
 
-          for i in $(seq 1 12); do
+          for i in $(seq 1 16); do
             RES=$(oci instance-agent command-execution get \
               --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" --output json 2>&1)
@@ -77,11 +89,7 @@ jobs:
                 echo "$RES"
                 exit 0 ;;
             esac
-            if [ "$i" = "1" ] && [ -z "$STATE" ]; then
-              echo "--- reponse brute ---"
-              echo "$RES" | head -40
-              echo "--- fin ---"
-            fi
             sleep 15
           done
-          echo "Pas de resultat apres 3 min."
+          echo "Toujours VISIBLE : l'agent invite ne consomme pas la commande."
+          echo "=> Le plugin Run Command n'est pas operationnel dans la VM."
