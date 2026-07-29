@@ -1,8 +1,8 @@
 name: OCI inspect (etat + contenu VM)
 
-# 1) Liste toutes les instances du compartiment (nom, shape, etat, ocpus).
+# 1) Liste toutes les instances du compartiment.
 # 2) Execute une commande LECTURE SEULE dans amd-vm via "Run Command" de
-#    l'agent Oracle (aucun SSH necessaire) et affiche le resultat.
+#    l'agent Oracle (aucun SSH) et affiche le resultat BRUT (diagnostic).
 #
 # La commande executee est de l'inspection pure : uname, RAM, disque, uptime,
 # services actifs, contenu de /home. Elle n'installe et ne modifie RIEN.
@@ -45,7 +45,7 @@ jobs:
       - name: Run Command - inspection lecture seule
         run: |
           set +e
-          SCRIPT='echo "== OS ==" ; uname -a ; echo ; echo "== Uptime ==" ; uptime ; echo ; echo "== RAM ==" ; free -h ; echo ; echo "== Disque ==" ; df -h / ; echo ; echo "== /home ==" ; ls -la /home/ubuntu 2>/dev/null || ls -la /home ; echo ; echo "== Services actifs ==" ; systemctl list-units --type=service --state=running --no-pager --no-legend | head -25 ; echo ; echo "== Ecoute reseau ==" ; (ss -tulnp 2>/dev/null || netstat -tulnp 2>/dev/null) | head -20'
+          SCRIPT='echo "== OS ==" ; uname -a ; echo ; echo "== Uptime ==" ; uptime ; echo ; echo "== RAM ==" ; free -h ; echo ; echo "== Disque ==" ; df -h / ; echo ; echo "== /home ==" ; ls -la /home/ubuntu 2>/dev/null || ls -la /home ; echo ; echo "== Services actifs ==" ; systemctl list-units --type=service --state=running --no-pager --no-legend | head -25'
 
           CONTENT=$(jq -nc --arg t "$SCRIPT" '{source:{sourceType:"TEXT",text:$t},output:{outputType:"TEXT"}}')
           TARGET=$(jq -nc --arg i "$INSTANCE_ID" '{instanceId:$i}')
@@ -59,27 +59,32 @@ jobs:
 
           CMD_ID=$(echo "$OUT" | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4)
           if [ -z "$CMD_ID" ]; then
-            echo "❌ Impossible de creer la commande. Reponse d'Oracle :"
+            echo "❌ Creation impossible. Reponse :"
             echo "$OUT" | head -40
-            echo
-            echo "Si le message parle du plugin/agent : activer 'Compute Instance Run Command'"
-            echo "dans la console OCI (Instance > Oracle Cloud Agent), puis relancer."
             exit 0
           fi
           echo "Command ID : $CMD_ID"
 
-          for i in $(seq 1 20); do
+          echo "=== Statut de la commande (command get) ==="
+          oci instance-agent command get --instance-agent-command-id "$CMD_ID" --output json 2>&1 | head -40
+
+          for i in $(seq 1 8); do
             RES=$(oci instance-agent command-execution get \
               --instance-agent-command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" --output json 2>&1)
-            STATE=$(echo "$RES" | grep -o '"lifecycle-state": *"[A-Z_]*"' | head -1 | cut -d'"' -f4)
+            if [ "$i" = "1" ]; then
+              echo "=== REPONSE BRUTE (1ere iteration) ==="
+              echo "$RES" | head -60
+              echo "=== fin reponse brute ==="
+            fi
+            STATE=$(echo "$RES" | grep -oiE '"(lifecycle-state|delivery-state)": *"[A-Za-z_]*"' | head -1 | cut -d'"' -f4)
             echo "[$i] etat : ${STATE:-inconnu}"
             case "$STATE" in
               SUCCEEDED|FAILED|TIMED_OUT|CANCELED)
-                echo "=== RESULTAT ==="
+                echo "=== RESULTAT COMPLET ==="
                 echo "$RES"
                 exit 0 ;;
             esac
             sleep 15
           done
-          echo "Toujours en cours apres 5 min — reessayer plus tard."
+          echo "Pas de resultat lisible apres 2 min — voir la reponse brute ci-dessus."
