@@ -2,7 +2,7 @@ name: OCI inspect (etat + contenu VM)
 
 # 1) Liste toutes les instances du compartiment.
 # 2) Execute une commande LECTURE SEULE dans amd-vm via "Run Command" de
-#    l'agent Oracle (aucun SSH) et affiche le resultat BRUT (diagnostic).
+#    l'agent Oracle (aucun SSH) et affiche le resultat.
 #
 # La commande executee est de l'inspection pure : uname, RAM, disque, uptime,
 # services actifs, contenu de /home. Elle n'installe et ne modifie RIEN.
@@ -65,26 +65,23 @@ jobs:
           fi
           echo "Command ID : $CMD_ID"
 
-          echo "=== Statut de la commande (command get) ==="
-          oci instance-agent command get --instance-agent-command-id "$CMD_ID" --output json 2>&1 | head -40
-
-          for i in $(seq 1 8); do
+          for i in $(seq 1 12); do
             RES=$(oci instance-agent command-execution get \
-              --instance-agent-command-id "$CMD_ID" \
+              --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" --output json 2>&1)
-            if [ "$i" = "1" ]; then
-              echo "=== REPONSE BRUTE (1ere iteration) ==="
-              echo "$RES" | head -60
-              echo "=== fin reponse brute ==="
-            fi
             STATE=$(echo "$RES" | grep -oiE '"(lifecycle-state|delivery-state)": *"[A-Za-z_]*"' | head -1 | cut -d'"' -f4)
             echo "[$i] etat : ${STATE:-inconnu}"
             case "$STATE" in
               SUCCEEDED|FAILED|TIMED_OUT|CANCELED)
-                echo "=== RESULTAT COMPLET ==="
+                echo "=== RESULTAT ==="
                 echo "$RES"
                 exit 0 ;;
             esac
+            if [ "$i" = "1" ] && [ -z "$STATE" ]; then
+              echo "--- reponse brute ---"
+              echo "$RES" | head -40
+              echo "--- fin ---"
+            fi
             sleep 15
           done
-          echo "Pas de resultat lisible apres 2 min — voir la reponse brute ci-dessus."
+          echo "Pas de resultat apres 3 min."
