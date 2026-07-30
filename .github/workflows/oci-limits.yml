@@ -1,0 +1,77 @@
+name: OCI limites reelles (quota du compte)
+
+# Interroge les LIMITES REELLES du compte (pas une doc generale) :
+#   - stockage bloc : limite totale en Go, et ce qui est deja consomme
+#   - cœurs ARM A1 et VM AMD micro : limite et disponible
+#   - taille reelle de chaque boot volume existant
+#
+# Sert a verifier combien de VM supplementaires tiennent dans le gratuit,
+# sans risque de facturation. LECTURE SEULE.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  limits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
+      TENANCY:             ${{ secrets.OCI_CLI_TENANCY }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Limites et consommation
+        run: |
+          set +e
+          AD=$(oci iam availability-domain list --query "data[0].name" --raw-output)
+          echo "AD : $AD"
+
+          echo
+          echo "=== BOOT VOLUMES EXISTANTS (taille reelle) ==="
+          oci bv boot-volume list -c "$COMPARTMENT" --availability-domain "$AD" \
+            --query 'data[?"lifecycle-state"!=`TERMINATED`].{nom:"display-name", Go:"size-in-gbs", etat:"lifecycle-state"}' \
+            --output table
+
+          echo
+          echo "=== TOTAL STOCKAGE UTILISE ==="
+          oci bv boot-volume list -c "$COMPARTMENT" --availability-domain "$AD" \
+            --query 'sum(data[?"lifecycle-state"!=`TERMINATED`]."size-in-gbs")' --raw-output
+          echo "  (Go de boot volumes)"
+          echo "Volumes de donnees supplementaires :"
+          oci bv volume list -c "$COMPARTMENT" --all \
+            --query 'sum(data[?"lifecycle-state"!=`TERMINATED`]."size-in-gbs")' --raw-output 2>/dev/null || echo "0"
+
+          echo
+          echo "=== LIMITE STOCKAGE BLOC DU COMPTE ==="
+          oci limits value list --compartment-id "$TENANCY" \
+            --service-name block-storage --all \
+            --query 'data[].{limite:name, valeur:value, scope:"scope-type"}' --output table
+
+          echo
+          echo "=== DISPONIBILITE STOCKAGE (limite / utilise / dispo) ==="
+          oci limits resource-availability get --compartment-id "$TENANCY" \
+            --service-name block-storage --limit-name total-storage-gb \
+            --availability-domain "$AD" --output json 2>&1 | head -20
+
+          echo
+          echo "=== LIMITES COMPUTE (ARM A1 et AMD micro) ==="
+          oci limits value list --compartment-id "$TENANCY" \
+            --service-name compute --all \
+            --query 'data[?contains(name, `a1`) || contains(name, `micro`)].{limite:name, valeur:value}' \
+            --output table
+
+          echo
+          echo "=== DISPONIBILITE CŒURS ARM A1 ==="
+          oci limits resource-availability get --compartment-id "$TENANCY" \
+            --service-name compute --limit-name standard-a1-core-count \
+            --availability-domain "$AD" --output json 2>&1 | head -20
