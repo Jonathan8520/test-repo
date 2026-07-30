@@ -1,23 +1,26 @@
 #!/bin/bash
-# Chasse les tranches ARM Always Free depuis la VM elle-meme (service continu).
+# Chasse les VM ARM Always Free depuis la VM elle-meme (service continu).
 #
 # Aucune cle stockee : authentification "instance principal".
 #
-# OPTIMISATION : la decouverte (compartiment, AD, sous-reseau, image, cle SSH)
-# est faite UNE SEULE FOIS au demarrage. La boucle ne fait plus qu'un appel
-# "launch" par tentative, au lieu de 7-9 appels par cycle. Sur une VM 1 Go,
-# chaque appel oci coute ~15 s de demarrage Python : c'est ce qui plombait
-# la cadence.
+# QUOTA REEL DE CE COMPTE (verifie par l'API, pas par la doc generale) :
+#   standard-a1-core-count   = 2
+#   standard-a1-memory-count = 12
+# Soit 2 cœurs / 12 Go au total pour l'ARM — et NON 4/24 comme l'annonce le
+# programme Always Free generique. Pour reverifier un jour :
+#   oci limits value list --compartment-id <tenancy> --service-name compute \
+#     --query 'data[?contains(name, `a1`)]' --output table
 #
-# Cibles (somme = 4 OCPU / 24 Go = maximum gratuit) :
-#   arm-vm-1 = 1 OCPU / 6 Go
-#   arm-vm-2 = 1 OCPU / 6 Go
-#   arm-vm-3 = 2 OCPU / 12 Go
+# STOCKAGE : 200 Go au total, 94 deja pris par les 2 VM AMD (47 Go chacune).
+# Il reste ~106 Go, soit 2 VM supplementaires maximum.
 #
-# Garde-fous anti-facturation :
-#   - budget = 4 - (OCPU ARM reellement utilises), revalide toutes les 20 boucles
-#   - decremente immediatement apres chaque creation reussie
-#   - une cible acquise n'est plus jamais retentee
+# STRATEGIE (rotation) : a chaque cycle on tente d'abord la grosse (2/12) ;
+# si elle ne passe pas, on tente la petite (1/6). On prend ce qui se libere
+# en premier, quitte a finir avec une seule petite VM.
+#   - budget 2 cœurs libres -> arm-vm-1 en 2/12, sinon arm-vm-1 en 1/6
+#   - arm-vm-1 deja prise en 1/6 -> arm-vm-2 en 1/6 (complete le quota)
+#
+# Depasser une limite de service ne facture RIEN : Oracle refuse la demande.
 
 set +e
 
@@ -26,12 +29,13 @@ AUTH="--auth instance_principal"
 MD="http://169.254.169.254/opc/v2"
 HDR="Authorization: Bearer Oracle"
 LOG=/var/log/oci-grabber.log
-GAP=25          # secondes entre deux tentatives
-BACKOFF=150     # pause si Oracle bride (TooManyRequests)
+MAXCORES=2      # quota ARM reel de ce compte
+GAP=25
+BACKOFF=150
 
 log() { echo "$(date -Is) $*" >> "$LOG"; }
 
-# ---------- Decouverte (une seule fois, avec attente si le reseau tarde) ----------
+# ---------- Decouverte (une seule fois) ----------
 while true; do
   INST=$(curl -s -m 10 -H "$HDR" "$MD/instance/")
   COMP=$(echo "$INST" | jq -r .compartmentId 2>/dev/null)
@@ -56,11 +60,11 @@ IMG=$($OCI $AUTH compute image list -c "$COMP" \
   --query 'data[0].id' --raw-output 2>/dev/null)
 [ -z "$IMG" ] && { log "ERREUR: image ARM introuvable"; exit 1; }
 
-log "demarrage : decouverte OK, chasse ARM active (1 tentative / ${GAP}s)"
+log "demarrage : decouverte OK — quota ARM $MAXCORES cœurs, rotation 2/12 puis 1/6"
 
-# ---------- Budget d'OCPU ARM ----------
-refresh_budget() {
-  local cnt used
+# ---------- Etat reel (budget + VM deja obtenues) ----------
+refresh_state() {
+  local cnt used t ex
   cnt=$($OCI $AUTH compute instance list -c "$COMP" --all \
     --query "length(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
     --raw-output 2>/dev/null)
@@ -71,31 +75,55 @@ refresh_budget() {
       --query "sum(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].\"shape-config\".ocpus)" \
       --raw-output 2>/dev/null)
   fi
-  case "$used" in ''|*[!0-9.]*) used=4 ;; esac
-  BUDGET=$(awk -v u="$used" 'BEGIN{printf "%d", 4-u}')
+  case "$used" in ''|*[!0-9.]*) used=$MAXCORES ;; esac
+  BUDGET=$(awk -v u="$used" -v m="$MAXCORES" 'BEGIN{printf "%d", m-u}')
   [ "$BUDGET" -lt 0 ] && BUDGET=0
 
-  # Cibles deja existantes -> ne plus les tenter
   ACQUIS=""
-  for T in arm-vm-1 arm-vm-2 arm-vm-3; do
-    local ex
+  for t in arm-vm-1 arm-vm-2; do
     ex=$($OCI $AUTH compute instance list -c "$COMP" --all \
-      --query "length(data[?\"display-name\"=='$T' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+      --query "length(data[?\"display-name\"=='$t' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
       --raw-output 2>/dev/null)
-    [ "$ex" != "0" ] && ACQUIS="$ACQUIS $T"
+    [ "$ex" != "0" ] && ACQUIS="$ACQUIS $t"
   done
 }
 
-refresh_budget
-log "budget initial : $BUDGET OCPU ; deja acquis :${ACQUIS:- aucun}"
+has() { echo "$ACQUIS" | grep -qw "$1"; }
+
+tenter() {
+  local NAME=$1 OCPU=$2 MEM=$3 OUT R
+  OUT=$($OCI $AUTH compute instance launch \
+    --availability-domain "$AD" --compartment-id "$COMP" \
+    --shape "VM.Standard.A1.Flex" --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $MEM}" \
+    --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
+    --display-name "$NAME" \
+    --metadata "{\"ssh_authorized_keys\": \"$PUBKEY\"}" 2>&1)
+
+  if echo "$OUT" | grep -q '"id"'; then
+    BUDGET=$((BUDGET - OCPU))
+    ACQUIS="$ACQUIS $NAME"
+    log "*** SUCCES *** $NAME creee ($OCPU cœur(s) / $MEM Go) — budget restant $BUDGET"
+    return 0
+  fi
+  R=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)
+  log "$NAME ${OCPU}/${MEM} -> ${R:-echec}"
+  if echo "$R" | grep -qi toomanyrequests; then
+    log "bride par Oracle -> pause ${BACKOFF}s"
+    sleep "$BACKOFF"
+    return 2
+  fi
+  return 1
+}
+
+refresh_state
+log "budget initial : $BUDGET cœur(s) ; deja acquis :${ACQUIS:- aucun}"
 
 # ---------- Boucle de chasse ----------
 I=0
 while true; do
-  # Revalidation periodique contre la realite (toutes les ~20 boucles)
   if [ $((I % 20)) -eq 0 ] && [ $I -gt 0 ]; then
-    refresh_budget
-    log "revalidation : budget $BUDGET OCPU ; acquis :${ACQUIS:- aucun}"
+    refresh_state
+    log "revalidation : budget $BUDGET ; acquis :${ACQUIS:- aucun}"
   fi
   I=$((I + 1))
 
@@ -104,33 +132,17 @@ while true; do
     exit 0
   fi
 
-  for T in "arm-vm-1 1 6" "arm-vm-2 1 6" "arm-vm-3 2 12"; do
-    set -- $T
-    NAME=$1; OCPU=$2; MEM=$3
-
-    echo "$ACQUIS" | grep -qw "$NAME" && continue
-    [ "$OCPU" -gt "$BUDGET" ] && continue
-
-    OUT=$($OCI $AUTH compute instance launch \
-      --availability-domain "$AD" --compartment-id "$COMP" \
-      --shape "VM.Standard.A1.Flex" --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $MEM}" \
-      --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
-      --display-name "$NAME" \
-      --metadata "{\"ssh_authorized_keys\": \"$PUBKEY\"}" 2>&1)
-
-    if echo "$OUT" | grep -q '"id"'; then
-      BUDGET=$((BUDGET - OCPU))
-      ACQUIS="$ACQUIS $NAME"
-      log "*** SUCCES *** $NAME creee ($OCPU OCPU / $MEM Go) — budget restant $BUDGET"
-    else
-      R=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)
-      log "$NAME -> ${R:-echec}"
-      if echo "$R" | grep -qi toomanyrequests; then
-        log "bride par Oracle -> pause ${BACKOFF}s"
-        sleep "$BACKOFF"
-        continue
-      fi
+  if ! has arm-vm-1; then
+    # Rotation : la grosse d'abord, la petite ensuite.
+    if [ "$BUDGET" -ge 2 ]; then
+      tenter arm-vm-1 2 12 && continue
+      sleep "$GAP"
     fi
+    has arm-vm-1 || { tenter arm-vm-1 1 6; sleep "$GAP"; }
+  elif ! has arm-vm-2 && [ "$BUDGET" -ge 1 ]; then
+    tenter arm-vm-2 1 6
     sleep "$GAP"
-  done
+  else
+    sleep "$GAP"
+  fi
 done
