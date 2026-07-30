@@ -1,33 +1,27 @@
-name: OCI capacity grabber
+name: OCI capacity grabber (secours + notification)
 
-# A chaque run (~toutes les 11 min), COMPLETE le quota Always Free en tentant
-# TOUTES les cibles manquantes, espacees pour ne pas se faire brider :
-#   - 2e VM AMD  : E2.1.Micro, 1 OCPU / 1 Go              -> "amd-vm-2"
-#   - VM ARM (liste-cible FIXE, somme = 4 OCPU / 24 Go) :
-#         arm-vm-1 = 1 OCPU / 6 Go
-#         arm-vm-2 = 1 OCPU / 6 Go
-#         arm-vm-3 = 2 OCPU / 12 Go
+# Depuis que la VM amd-vm-2 chasse en continu (1 tentative / 25 s), ce workflow
+# change de role. Il devient :
 #
-# POURQUOI TOUT TENTER : la capacite dispo depend de la TAILLE demandee. Un trou
-# de 1 OCPU peut exister quand un trou de 2 OCPU n'existe pas. Tenter les trois
-# formats = trois chances independantes au lieu d'une.
+#   1. LE NOTIFICATEUR — c'est lui qui t'envoie un mail. Il detecte toute VM ARM
+#      presente, quelle que soit la machine qui l'a creee, et ouvre une issue
+#      (une seule par VM, il verifie qu'elle n'existe pas deja).
 #
-# ANTI-BRIDAGE : 45 s entre chaque tentative, et arret immediat du run si Oracle
-# renvoie TooManyRequests (inutile d'insister, ca aggrave le bridage).
+#   2. UN FILET DE SECOURS — il retente les cibles manquantes, mais seulement
+#      toutes les 30 min, pour ne pas entrer en concurrence avec la VM et
+#      declencher des TooManyRequests cote Oracle.
 #
-# SECURITE ANTI-FACTURATION (triple garde-fou) :
-#   1) une cible n'est tentee que si aucune instance de ce nom n'existe
-#      (comptage devant valoir EXACTEMENT 0 ; en cas de doute -> on saute) ;
-#   2) budget d'OCPU ARM calcule au debut du run (4 - deja utilises) ;
-#   3) ce budget est DECREMENTE a chaque creation reussie dans le run meme,
-#      donc impossible de depasser 4 OCPU meme si les 3 cibles passent d'un coup.
+# Cibles ARM (somme = 4 OCPU / 24 Go = maximum gratuit) :
+#   arm-vm-1 = 1/6, arm-vm-2 = 1/6, arm-vm-3 = 2/12
 #
-# Ne fait QUE creer ; ne touche jamais aux instances existantes.
-# Ouvre une issue (= mail) a chaque creation. A DESACTIVER quand le quota est plein.
+# Anti-facturation : budget = 4 - OCPU deja utilises, decremente a chaque
+# creation reussie dans le run. Une cible existante n'est jamais recreee.
+#
+# A DESACTIVER quand le quota est plein (Actions > ... > Disable).
 
 on:
   schedule:
-    - cron: '*/11 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -40,7 +34,7 @@ concurrency:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
       OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
@@ -55,61 +49,53 @@ jobs:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Tenter toutes les cibles manquantes (espacees)
+      - name: Notifier les VM ARM existantes
+        run: |
+          set +e
+          for NAME in arm-vm-1 arm-vm-2 arm-vm-3; do
+            EX=$(oci compute instance list -c "$COMPARTMENT" --all \
+              --query "length(data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+              --raw-output 2>/dev/null)
+            [ "$EX" = "0" ] || [ -z "$EX" ] && continue
+
+            # Une issue existe-t-elle deja pour cette VM ?
+            FOUND=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all \
+              --search "$NAME in:title" --json number --jq 'length' 2>/dev/null)
+            if [ "$FOUND" != "0" ] && [ -n "$FOUND" ]; then
+              echo "$NAME : deja notifiee"
+              continue
+            fi
+
+            IP=""
+            ID=$(oci compute instance list -c "$COMPARTMENT" --all \
+              --query "data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED'].id | [0]" --raw-output 2>/dev/null)
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              VN=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0].id' --raw-output 2>/dev/null)
+              IP=$(oci network vnic get --vnic-id "$VN" --query 'data."public-ip"' --raw-output 2>/dev/null)
+            fi
+
+            echo "$NAME : nouvelle -> notification"
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "🎉 $NAME obtenue (VM ARM)" \
+              --body "Une machine **ARM** vient d'etre obtenue : **$NAME**.
+
+IP publique : \`${IP:-a recuperer dans la console OCI}\`
+
+Connexion : \`ssh -i ~/.ssh/main-vm ubuntu@${IP:-IP_PUBLIQUE}\` (depuis le Cloud Shell OCI).
+
+Quand tout ton quota ARM est pris (4 OCPU / 24 Go), pense a desactiver ce workflow et le service sur amd-vm-2 :
+\`sudo systemctl disable --now oci-grabber\`"
+          done
+
+      - name: Filet de secours - tenter les cibles manquantes
         run: |
           set +e
           AD=$(oci iam availability-domain list --query "data[0].name" --raw-output)
-          echo "AD : $AD"
 
-          notify() {
-            gh issue create --repo "$GITHUB_REPOSITORY" \
-              --title "✅ $1 creee sur OCI" \
-              --body "Le grabber a cree **$1**. Recupere son IP publique dans la console OCI > Compute > Instances, puis connecte-toi : ssh -i ~/.ssh/main-vm ubuntu@IP_PUBLIQUE. Desactive ce workflow quand ton quota est plein."
-          }
-
-          # Compte les instances portant un nom donne (0 = absente, sinon on saute).
-          count_named() {
-            oci compute instance list -c "$COMPARTMENT" --all \
-              --query "length(data[?\"display-name\"=='$1' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
-              --raw-output 2>/dev/null
-          }
-
-          # ===== 2e VM AMD =====
-          AMD_N=$(oci compute instance list -c "$COMPARTMENT" --all \
-            --query "length(data[?\"shape\"=='VM.Standard.E2.1.Micro' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
-            --raw-output 2>/dev/null)
-          case "$AMD_N" in ''|*[!0-9]*) AMD_N=2 ;; esac
-          echo "AMD : $AMD_N/2"
-
-          RATE_LIMITED=0
-
-          if [ "$AMD_N" -lt 2 ]; then
-            IMG=$(oci compute image list -c "$COMPARTMENT" \
-              --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
-              --shape "VM.Standard.E2.1.Micro" --sort-by TIMECREATED \
-              --query "data[0].id" --raw-output)
-            echo "Tentative amd-vm-2 (1 OCPU / 1 Go)…"
-            OUT=$(oci compute instance launch \
-              --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
-              --shape "VM.Standard.E2.1.Micro" \
-              --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
-              --display-name "amd-vm-2" \
-              --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
-            if echo "$OUT" | grep -q '"id"'; then
-              echo "✅ amd-vm-2 creee"; notify "amd-vm-2"
-            else
-              REASON=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)
-              echo "amd-vm-2 -> ${REASON:-echec}"
-              echo "$REASON" | grep -qi toomanyrequests && RATE_LIMITED=1
-            fi
-            sleep 45
-          fi
-
-          # ===== ARM : budget d'OCPU disponible =====
-          ARM_COUNT=$(oci compute instance list -c "$COMPARTMENT" --all \
+          CNT=$(oci compute instance list -c "$COMPARTMENT" --all \
             --query "length(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
             --raw-output 2>/dev/null)
-          if [ "$ARM_COUNT" = "0" ]; then
+          if [ "$CNT" = "0" ]; then
             USED=0
           else
             USED=$(oci compute instance list -c "$COMPARTMENT" --all \
@@ -119,52 +105,38 @@ jobs:
           case "$USED" in ''|*[!0-9.]*) USED=4 ;; esac
           BUDGET=$(awk -v u="$USED" 'BEGIN{printf "%d", 4-u}')
           [ "$BUDGET" -lt 0 ] && BUDGET=0
-          echo "ARM : $USED/4 OCPU utilises -> budget restant $BUDGET OCPU"
+          echo "ARM : $USED/4 OCPU utilises -> budget $BUDGET"
+          [ "$BUDGET" -le 0 ] && { echo "Quota ARM plein — pensez a desactiver ce workflow."; exit 0; }
 
-          IMG_ARM=$(oci compute image list -c "$COMPARTMENT" \
+          IMG=$(oci compute image list -c "$COMPARTMENT" \
             --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
             --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
-            --query "data[0].id" --raw-output)
+            --query 'data[0].id' --raw-output 2>/dev/null)
 
-          # On tente CHAQUE cible manquante, en decrementant le budget au fur et a mesure.
-          for TARGET in "arm-vm-1 1 6" "arm-vm-2 1 6" "arm-vm-3 2 12"; do
-            set -- $TARGET
+          for T in "arm-vm-1 1 6" "arm-vm-2 1 6" "arm-vm-3 2 12"; do
+            set -- $T
             NAME=$1; OCPU=$2; MEM=$3
 
-            if [ "$RATE_LIMITED" = "1" ]; then
-              echo "Bride par Oracle -> on arrete ce run, le prochain reessaiera."
-              break
-            fi
+            EX=$(oci compute instance list -c "$COMPARTMENT" --all \
+              --query "length(data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+              --raw-output 2>/dev/null)
+            [ "$EX" != "0" ] && continue
+            [ "$OCPU" -gt "$BUDGET" ] && continue
 
-            EX=$(count_named "$NAME")
-            if [ "$EX" != "0" ]; then
-              echo "$NAME : existe deja (ou comptage incertain) -> saut"
-              continue
-            fi
-
-            if [ "$OCPU" -gt "$BUDGET" ]; then
-              echo "$NAME : budget insuffisant ($OCPU > $BUDGET OCPU) -> saut"
-              continue
-            fi
-
-            echo "Tentative $NAME ($OCPU OCPU / $MEM Go)…"
             OUT=$(oci compute instance launch \
               --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
               --shape "VM.Standard.A1.Flex" --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $MEM}" \
-              --image-id "$IMG_ARM" --subnet-id "$SUBNET" --assign-public-ip true \
+              --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
               --display-name "$NAME" \
               --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
 
             if echo "$OUT" | grep -q '"id"'; then
               BUDGET=$((BUDGET - OCPU))
-              echo "✅ $NAME creee ($OCPU OCPU / $MEM Go) — budget restant : $BUDGET OCPU"
-              notify "$NAME"
+              echo "✅ $NAME creee — notification au prochain passage"
             else
-              REASON=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)
-              echo "$NAME -> ${REASON:-echec}"
-              echo "$REASON" | grep -qi toomanyrequests && RATE_LIMITED=1
+              R=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)
+              echo "$NAME -> ${R:-echec}"
+              echo "$R" | grep -qi toomanyrequests && break
             fi
             sleep 45
           done
-
-          echo "Fin du run."
