@@ -1,0 +1,95 @@
+name: OCI fix reseau (route Internet)
+
+# Repare l'acces reseau du sous-reseau : sans route 0.0.0.0/0 vers une
+# passerelle Internet, aucune instance ne peut communiquer avec l'exterieur
+# (ni SSH entrant, ni appels sortants vers l'API OCI, ni agent Oracle).
+#
+# Ce workflow :
+#   1. retrouve le VCN du sous-reseau de l'instance
+#   2. cree une passerelle Internet si aucune n'existe (sinon reutilise)
+#   3. ajoute la route 0.0.0.0/0 -> passerelle dans la table de routage
+#
+# Les regles de pare-feu (security list) ne sont PAS modifiees : elles
+# autorisent deja uniquement SSH (port 22) et ICMP.
+#
+# Reversible : supprimer la route dans la console OCI
+# (Networking > VCN > Route Tables) coupe a nouveau l'acces.
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_name:
+        description: "Instance dont on repare le sous-reseau"
+        required: true
+        default: "amd-vm-2"
+
+permissions:
+  contents: read
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
+      NAME:                ${{ github.event.inputs.instance_name }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Reparer la route Internet
+        run: |
+          set +e
+          ID=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query "data[?\"display-name\"=='$NAME' && \"lifecycle-state\"=='RUNNING'].id | [0]" \
+            --raw-output 2>/dev/null)
+          [ -z "$ID" ] && { echo "Instance introuvable"; exit 1; }
+
+          VNIC=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0].id' --raw-output)
+          SUBNET=$(oci network vnic get --vnic-id "$VNIC" --query 'data."subnet-id"' --raw-output)
+          VCN=$(oci network subnet get --subnet-id "$SUBNET" --query 'data."vcn-id"' --raw-output)
+          RT=$(oci network subnet get --subnet-id "$SUBNET" --query 'data."route-table-id"' --raw-output)
+          echo "VCN          : $VCN"
+          echo "Table routage: $RT"
+
+          # --- Passerelle Internet ---
+          IGW=$(oci network internet-gateway list -c "$COMPARTMENT" --vcn-id "$VCN" --all \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$IGW" ] || [ "$IGW" = "null" ]; then
+            echo "Aucune passerelle Internet -> creation…"
+            IGW=$(oci network internet-gateway create -c "$COMPARTMENT" --vcn-id "$VCN" \
+              --is-enabled true --display-name "internet-gateway" \
+              --wait-for-state AVAILABLE --query 'data.id' --raw-output 2>&1 | tail -1)
+          else
+            echo "Passerelle existante reutilisee."
+            ENABLED=$(oci network internet-gateway get --ig-id "$IGW" \
+              --query 'data."is-enabled"' --raw-output 2>/dev/null)
+            if [ "$ENABLED" != "true" ]; then
+              echo "Passerelle desactivee -> activation…"
+              oci network internet-gateway update --ig-id "$IGW" --is-enabled true --force >/dev/null 2>&1
+            fi
+          fi
+          echo "Passerelle    : $IGW"
+          [ -z "$IGW" ] && { echo "Echec passerelle"; exit 1; }
+
+          # --- Route 0.0.0.0/0 ---
+          EXISTING=$(oci network route-table get --rt-id "$RT" --query 'data."route-rules"' --output json 2>/dev/null)
+          if echo "$EXISTING" | grep -q '0.0.0.0/0'; then
+            echo "Route 0.0.0.0/0 deja presente — rien a faire."
+            echo "$EXISTING"
+            exit 0
+          fi
+
+          RULES=$(jq -nc --arg g "$IGW" '[{destination:"0.0.0.0/0", destinationType:"CIDR_BLOCK", networkEntityId:$g, description:"Acces Internet"}]')
+          echo "Ajout de la route 0.0.0.0/0 -> passerelle…"
+          oci network route-table update --rt-id "$RT" --route-rules "$RULES" --force \
+            --query 'data."route-rules"' --output json 2>&1 | head -20
+
+          echo
+          echo "=== Verification ==="
+          oci network route-table get --rt-id "$RT" --query 'data."route-rules"' --output json 2>&1 | head -20
