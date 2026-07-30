@@ -1,14 +1,11 @@
 #!/bin/bash
-# Installe le grabber ARM sur cette VM (a lancer avec sudo, une seule fois).
+# Installe (ou met a jour) le grabber ARM sur cette VM.
 #
 #   curl -sL https://raw.githubusercontent.com/Jonathan8520/test-repo/main/vm/install.sh -o install.sh
 #   sudo bash install.sh
 #
-# Ce script :
-#   1. cree 1 Go de swap (la VM n'a que 1 Go de RAM, c'est juste pour l'install)
-#   2. installe l'OCI CLI dans un venv isole
-#   3. installe /opt/oci-grabber/grab.sh
-#   4. cree un service systemd qui tente les cibles ARM toutes les 30 s
+# Relancer cette meme commande met simplement le script a jour et redemarre
+# le service : c'est sans risque.
 #
 # Desinstallation :
 #   sudo systemctl disable --now oci-grabber && sudo rm -rf /opt/oci-grabber \
@@ -51,7 +48,9 @@ curl -sL https://raw.githubusercontent.com/Jonathan8520/test-repo/main/vm/grab.s
 chmod +x /opt/oci-grabber/grab.sh
 touch /var/log/oci-grabber.log
 
-echo "== 4/4 Service systemd (toutes les 30 s) =="
+echo "== 4/4 Service systemd =="
+# grab.sh boucle lui-meme en interne (la decouverte n'est faite qu'une fois),
+# donc systemd le lance directement, sans boucle shell externe.
 cat > /etc/systemd/system/oci-grabber.service <<'UNIT'
 [Unit]
 Description=OCI ARM capacity grabber
@@ -60,23 +59,21 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'while true; do /opt/oci-grabber/grab.sh; sleep 30; done'
+ExecStart=/opt/oci-grabber/grab.sh
 Restart=always
-RestartSec=10
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now oci-grabber
+systemctl enable oci-grabber >/dev/null 2>&1
+systemctl restart oci-grabber
 
 echo
 echo "=== TERMINE ==="
+sleep 3
 systemctl is-active oci-grabber && echo "Service actif."
-echo
-echo "Verifier le test d'authentification (doit afficher un OCID) :"
-/opt/oci-grabber/venv/bin/oci --auth instance_principal iam region list \
-  --query 'data[0].key' --raw-output 2>&1 | head -3
 echo
 echo "Suivre les tentatives en direct :  sudo tail -f /var/log/oci-grabber.log"
