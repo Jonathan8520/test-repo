@@ -1,0 +1,91 @@
+name: OCI diag reseau (SSH bloque ?)
+
+# Diagnostic LECTURE SEULE du reseau d'une instance :
+#   - sous-reseau, IP publique
+#   - regles d'entree des security lists (port 22 autorise ?)
+#   - NSG eventuels attaches a la carte reseau
+#   - table de routage (passerelle Internet presente ?)
+#
+# Ne modifie RIEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_name:
+        description: "Nom de l'instance a diagnostiquer"
+        required: true
+        default: "amd-vm-2"
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
+      NAME:                ${{ github.event.inputs.instance_name }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Diagnostic reseau
+        run: |
+          set +e
+          ID=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query "data[?\"display-name\"=='$NAME' && \"lifecycle-state\"=='RUNNING'].id | [0]" \
+            --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            echo "Instance '$NAME' introuvable."; exit 0
+          fi
+          echo "Instance : $NAME"
+
+          VNIC=$(oci compute instance list-vnics --instance-id "$ID" \
+            --query 'data[0].id' --raw-output 2>/dev/null)
+          echo "=== VNIC ==="
+          oci network vnic get --vnic-id "$VNIC" \
+            --query 'data.{publicIp:"public-ip", privateIp:"private-ip", subnet:"subnet-id", nsgs:"nsg-ids", skipSrcDst:"skip-source-dest-check"}' \
+            --output json
+
+          SUBNET=$(oci network vnic get --vnic-id "$VNIC" \
+            --query 'data."subnet-id"' --raw-output 2>/dev/null)
+
+          echo "=== SOUS-RESEAU ==="
+          oci network subnet get --subnet-id "$SUBNET" \
+            --query 'data.{name:"display-name", cidr:"cidr-block", public:"prohibit-public-ip-on-vnic", secLists:"security-list-ids", routeTable:"route-table-id"}' \
+            --output json
+
+          echo "=== REGLES D ENTREE (security lists) ==="
+          SLS=$(oci network subnet get --subnet-id "$SUBNET" \
+            --query 'data."security-list-ids"' --raw-output 2>/dev/null | tr -d '[]", ' | tr '\n' ' ')
+          for SL in $SLS; do
+            [ -z "$SL" ] && continue
+            echo "--- security list : $SL"
+            oci network security-list get --security-list-id "$SL" \
+              --query 'data."ingress-security-rules"' --output json 2>&1 | head -60
+          done
+
+          echo "=== NSG attaches a la VNIC ==="
+          NSGS=$(oci network vnic get --vnic-id "$VNIC" \
+            --query 'data."nsg-ids"' --raw-output 2>/dev/null | tr -d '[]", ' | tr '\n' ' ')
+          if [ -z "$(echo $NSGS | tr -d ' ')" ]; then
+            echo "  (aucun NSG)"
+          else
+            for N in $NSGS; do
+              [ -z "$N" ] && continue
+              echo "--- NSG : $N"
+              oci network nsg rules list --nsg-id "$N" --direction INGRESS --output json 2>&1 | head -40
+            done
+          fi
+
+          echo "=== TABLE DE ROUTAGE ==="
+          RT=$(oci network subnet get --subnet-id "$SUBNET" \
+            --query 'data."route-table-id"' --raw-output 2>/dev/null)
+          oci network route-table get --rt-id "$RT" \
+            --query 'data."route-rules"' --output json 2>&1 | head -40
