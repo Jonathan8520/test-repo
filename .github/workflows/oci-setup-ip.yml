@@ -1,0 +1,97 @@
+name: OCI setup instance-principal (+ IP publiques)
+
+# Prepare la chasse ARM depuis la VM elle-meme, SANS jamais poser de cle dessus.
+#
+# 1) Affiche les IP publiques des instances (pour se connecter en SSH).
+# 2) Cree un groupe dynamique : "toute instance de ce compartiment".
+# 3) Cree une politique donnant a ce groupe le droit de creer des instances
+#    DANS CE COMPARTIMENT UNIQUEMENT (pas ailleurs, pas de droits IAM).
+#
+# Resultat : la VM pourra s'authentifier "en tant qu'elle-meme"
+# (oci --auth instance_principal) sans aucune cle privee stockee dessus.
+#
+# Reversible : supprimer la politique et le groupe dans la console OCI
+# (Identity > Policies / Dynamic Groups) revoque tout immediatement.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
+      TENANCY:             ${{ secrets.OCI_CLI_TENANCY }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: IP publiques des instances
+        run: |
+          set +e
+          echo "=== IP PUBLIQUES ==="
+          IDS=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query 'data[?"lifecycle-state"==`RUNNING`].id' --raw-output 2>/dev/null \
+            | tr -d '[]", ' | tr '\n' ' ')
+          for ID in $IDS; do
+            [ -z "$ID" ] && continue
+            NAME=$(oci compute instance get --instance-id "$ID" \
+              --query 'data."display-name"' --raw-output 2>/dev/null)
+            IP=$(oci compute instance list-vnics --instance-id "$ID" \
+              --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+            echo "  $NAME  ->  ${IP:-(pas d IP publique)}"
+          done
+
+      - name: Groupe dynamique
+        run: |
+          set +e
+          RULE="ANY {instance.compartment.id = '$COMPARTMENT'}"
+          EXIST=$(oci iam dynamic-group list --all \
+            --query "data[?name=='oci-grabber-dg'].id" --raw-output 2>/dev/null | tr -d '[]", ')
+          if [ -n "$EXIST" ]; then
+            echo "Groupe dynamique deja present : $EXIST"
+          else
+            echo "Creation du groupe dynamique…"
+            oci iam dynamic-group create \
+              --name "oci-grabber-dg" \
+              --description "Instances autorisees a lancer des VMs Always Free" \
+              --matching-rule "$RULE" \
+              --query 'data.{name:name,id:id}' --output json 2>&1 | head -20
+          fi
+
+      - name: Politique (droits limites au compartiment)
+        run: |
+          set +e
+          EXIST=$(oci iam policy list -c "$TENANCY" --all \
+            --query "data[?name=='oci-grabber-policy'].id" --raw-output 2>/dev/null | tr -d '[]", ')
+          if [ -n "$EXIST" ]; then
+            echo "Politique deja presente : $EXIST"
+            exit 0
+          fi
+          STMTS=$(jq -nc --arg c "$COMPARTMENT" '[
+            "Allow dynamic-group oci-grabber-dg to manage instance-family in compartment id \($c)",
+            "Allow dynamic-group oci-grabber-dg to use virtual-network-family in compartment id \($c)",
+            "Allow dynamic-group oci-grabber-dg to read instance-images in compartment id \($c)"
+          ]')
+          echo "Creation de la politique…"
+          oci iam policy create \
+            --compartment-id "$TENANCY" \
+            --name "oci-grabber-policy" \
+            --description "Autorise les instances du compartiment a lancer des VMs Always Free" \
+            --statements "$STMTS" \
+            --query 'data.{name:name,id:id}' --output json 2>&1 | head -30
+
+      - name: Recapitulatif
+        run: |
+          echo "Si le groupe et la politique sont crees, la VM peut desormais utiliser :"
+          echo "  oci --auth instance_principal ..."
+          echo "sans aucune cle privee stockee dessus."
