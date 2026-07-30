@@ -1,21 +1,17 @@
 name: OCI capacity grabber (secours + notification)
 
-# Depuis que la VM amd-vm-2 chasse en continu (1 tentative / 25 s), ce workflow
-# change de role. Il devient :
+# La VM amd-vm-2 fait la chasse rapide (1 tentative / 25 s). Ce workflow :
+#   1. NOTIFIE — ouvre une issue (= mail) pour toute VM ARM detectee, quelle
+#      que soit la machine qui l'a creee, sans doublon.
+#   2. SERT DE SECOURS — retente les cibles manquantes toutes les 30 min
+#      seulement, pour ne pas concurrencer la VM (source de TooManyRequests).
 #
-#   1. LE NOTIFICATEUR — c'est lui qui t'envoie un mail. Il detecte toute VM ARM
-#      presente, quelle que soit la machine qui l'a creee, et ouvre une issue
-#      (une seule par VM, il verifie qu'elle n'existe pas deja).
+# QUOTA REEL DE CE COMPTE (verifie par l'API) :
+#   standard-a1-core-count = 2, standard-a1-memory-count = 12
+# Soit 2 cœurs / 12 Go d'ARM au total — pas 4/24. Stockage : 200 Go, 94 pris.
 #
-#   2. UN FILET DE SECOURS — il retente les cibles manquantes, mais seulement
-#      toutes les 30 min, pour ne pas entrer en concurrence avec la VM et
-#      declencher des TooManyRequests cote Oracle.
-#
-# Cibles ARM (somme = 4 OCPU / 24 Go = maximum gratuit) :
-#   arm-vm-1 = 1/6, arm-vm-2 = 1/6, arm-vm-3 = 2/12
-#
-# Anti-facturation : budget = 4 - OCPU deja utilises, decremente a chaque
-# creation reussie dans le run. Une cible existante n'est jamais recreee.
+# Rotation : on tente d'abord arm-vm-1 en 2/12 ; a defaut arm-vm-1 en 1/6 ;
+# puis arm-vm-2 en 1/6 si la premiere est partie en petit format.
 #
 # A DESACTIVER quand le quota est plein (Actions > ... > Disable).
 
@@ -45,6 +41,7 @@ jobs:
       SUBNET:              ${{ secrets.OCI_SUBNET }}
       SSH_PUBKEY:          ${{ secrets.OCI_SSH_PUBKEY }}
       GH_TOKEN:            ${{ secrets.GITHUB_TOKEN }}
+      MAXCORES:            "2"
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
@@ -52,39 +49,39 @@ jobs:
       - name: Notifier les VM ARM existantes
         run: |
           set +e
-          for NAME in arm-vm-1 arm-vm-2 arm-vm-3; do
+          for NAME in arm-vm-1 arm-vm-2; do
             EX=$(oci compute instance list -c "$COMPARTMENT" --all \
               --query "length(data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
               --raw-output 2>/dev/null)
             [ "$EX" = "0" ] || [ -z "$EX" ] && continue
 
-            # Une issue existe-t-elle deja pour cette VM ?
             FOUND=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all \
               --search "$NAME in:title" --json number --jq 'length' 2>/dev/null)
             if [ "$FOUND" != "0" ] && [ -n "$FOUND" ]; then
-              echo "$NAME : deja notifiee"
-              continue
+              echo "$NAME : deja notifiee"; continue
             fi
 
-            IP=""
             ID=$(oci compute instance list -c "$COMPARTMENT" --all \
               --query "data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED'].id | [0]" --raw-output 2>/dev/null)
+            IP=""
             if [ -n "$ID" ] && [ "$ID" != "null" ]; then
               VN=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0].id' --raw-output 2>/dev/null)
               IP=$(oci network vnic get --vnic-id "$VN" --query 'data."public-ip"' --raw-output 2>/dev/null)
             fi
+            SPEC=$(oci compute instance get --instance-id "$ID" \
+              --query 'data."shape-config".{c:ocpus, m:"memory-in-gbs"}' --output json 2>/dev/null | tr -d '\n ')
 
             echo "$NAME : nouvelle -> notification"
             gh issue create --repo "$GITHUB_REPOSITORY" \
               --title "🎉 $NAME obtenue (VM ARM)" \
               --body "Une machine **ARM** vient d'etre obtenue : **$NAME**.
 
+Config : \`$SPEC\`
 IP publique : \`${IP:-a recuperer dans la console OCI}\`
 
-Connexion : \`ssh -i ~/.ssh/main-vm ubuntu@${IP:-IP_PUBLIQUE}\` (depuis le Cloud Shell OCI).
+Connexion : \`ssh -i ~/.ssh/main-vm ubuntu@${IP:-IP_PUBLIQUE}\`
 
-Quand tout ton quota ARM est pris (4 OCPU / 24 Go), pense a desactiver ce workflow et le service sur amd-vm-2 :
-\`sudo systemctl disable --now oci-grabber\`"
+Quota ARM de ce compte : 2 cœurs / 12 Go. Quand il est plein, pense a desactiver ce workflow, et le service sur amd-vm-2 s'arretera de lui-meme."
           done
 
       - name: Filet de secours - tenter les cibles manquantes
@@ -102,10 +99,10 @@ Quand tout ton quota ARM est pris (4 OCPU / 24 Go), pense a desactiver ce workfl
               --query "sum(data[?\"shape\"=='VM.Standard.A1.Flex' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].\"shape-config\".ocpus)" \
               --raw-output 2>/dev/null)
           fi
-          case "$USED" in ''|*[!0-9.]*) USED=4 ;; esac
-          BUDGET=$(awk -v u="$USED" 'BEGIN{printf "%d", 4-u}')
+          case "$USED" in ''|*[!0-9.]*) USED=$MAXCORES ;; esac
+          BUDGET=$(awk -v u="$USED" -v m="$MAXCORES" 'BEGIN{printf "%d", m-u}')
           [ "$BUDGET" -lt 0 ] && BUDGET=0
-          echo "ARM : $USED/4 OCPU utilises -> budget $BUDGET"
+          echo "ARM : $USED/$MAXCORES cœurs utilises -> budget $BUDGET"
           [ "$BUDGET" -le 0 ] && { echo "Quota ARM plein — pensez a desactiver ce workflow."; exit 0; }
 
           IMG=$(oci compute image list -c "$COMPARTMENT" \
@@ -113,30 +110,41 @@ Quand tout ton quota ARM est pris (4 OCPU / 24 Go), pense a desactiver ce workfl
             --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED \
             --query 'data[0].id' --raw-output 2>/dev/null)
 
-          for T in "arm-vm-1 1 6" "arm-vm-2 1 6" "arm-vm-3 2 12"; do
-            set -- $T
-            NAME=$1; OCPU=$2; MEM=$3
-
-            EX=$(oci compute instance list -c "$COMPARTMENT" --all \
-              --query "length(data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+          existe() {
+            local n=$1 e
+            e=$(oci compute instance list -c "$COMPARTMENT" --all \
+              --query "length(data[?\"display-name\"=='$n' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
               --raw-output 2>/dev/null)
-            [ "$EX" != "0" ] && continue
-            [ "$OCPU" -gt "$BUDGET" ] && continue
+            [ "$e" != "0" ]
+          }
 
+          tenter() {
+            local NAME=$1 OCPU=$2 MEM=$3 OUT R
+            echo "Tentative $NAME ($OCPU cœur(s) / $MEM Go)…"
             OUT=$(oci compute instance launch \
               --availability-domain "$AD" --compartment-id "$COMPARTMENT" \
               --shape "VM.Standard.A1.Flex" --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $MEM}" \
               --image-id "$IMG" --subnet-id "$SUBNET" --assign-public-ip true \
               --display-name "$NAME" \
               --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBKEY\"}" 2>&1)
-
             if echo "$OUT" | grep -q '"id"'; then
-              BUDGET=$((BUDGET - OCPU))
               echo "✅ $NAME creee — notification au prochain passage"
-            else
-              R=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)
-              echo "$NAME -> ${R:-echec}"
-              echo "$R" | grep -qi toomanyrequests && break
+              return 0
             fi
-            sleep 45
-          done
+            R=$(echo "$OUT" | grep -oiE 'out of host capacity|toomanyrequests|limitexceeded' | head -1)
+            echo "$NAME -> ${R:-echec}"
+            return 1
+          }
+
+          # Rotation : la grosse d'abord, la petite ensuite.
+          if ! existe arm-vm-1; then
+            if [ "$BUDGET" -ge 2 ]; then
+              tenter arm-vm-1 2 12 && exit 0
+              sleep 45
+            fi
+            tenter arm-vm-1 1 6 && exit 0
+          elif ! existe arm-vm-2 && [ "$BUDGET" -ge 1 ]; then
+            tenter arm-vm-2 1 6
+          else
+            echo "Rien a tenter."
+          fi
