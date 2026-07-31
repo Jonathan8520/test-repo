@@ -13,6 +13,11 @@ name: OCI capacity grabber (secours + notification)
 # Rotation : on tente d'abord arm-vm-1 en 2/12 ; a defaut arm-vm-1 en 1/6 ;
 # puis arm-vm-2 en 1/6 si la premiere est partie en petit format.
 #
+# ATTENTION MAINTENANCE : ne jamais ecrire de ligne commencant en colonne 0
+# a l'interieur d'un bloc "run: |" (texte multi-ligne d'une issue, heredoc…).
+# Cela termine le bloc YAML et rend le workflow invalide : GitHub cesse alors
+# TOUTES les executions planifiees. Construire ces textes avec printf.
+#
 # A DESACTIVER quand le quota est plein (Actions > ... > Disable).
 
 on:
@@ -68,20 +73,14 @@ jobs:
               VN=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0].id' --raw-output 2>/dev/null)
               IP=$(oci network vnic get --vnic-id "$VN" --query 'data."public-ip"' --raw-output 2>/dev/null)
             fi
-            SPEC=$(oci compute instance get --instance-id "$ID" \
-              --query 'data."shape-config".{c:ocpus, m:"memory-in-gbs"}' --output json 2>/dev/null | tr -d '\n ')
+            CORES=$(oci compute instance get --instance-id "$ID" --query 'data."shape-config".ocpus' --raw-output 2>/dev/null)
+            MEM=$(oci compute instance get --instance-id "$ID" --query 'data."shape-config"."memory-in-gbs"' --raw-output 2>/dev/null)
+
+            # Corps construit avec printf : aucune ligne en colonne 0 dans le YAML.
+            BODY=$(printf 'Nouvelle machine **ARM** obtenue : **%s**\n\nConfiguration : %s cœur(s) / %s Go\nIP publique : `%s`\n\nConnexion :\n```\nssh -i ~/.ssh/main-vm ubuntu@%s\n```\n\nQuota ARM de ce compte : 2 cœurs / 12 Go. Quand il est plein, le service sur amd-vm-2 sarrete seul ; pense a desactiver ce workflow.\n' "$NAME" "${CORES:-?}" "${MEM:-?}" "${IP:-a recuperer dans la console OCI}" "${IP:-IP_PUBLIQUE}")
 
             echo "$NAME : nouvelle -> notification"
-            gh issue create --repo "$GITHUB_REPOSITORY" \
-              --title "🎉 $NAME obtenue (VM ARM)" \
-              --body "Une machine **ARM** vient d'etre obtenue : **$NAME**.
-
-Config : \`$SPEC\`
-IP publique : \`${IP:-a recuperer dans la console OCI}\`
-
-Connexion : \`ssh -i ~/.ssh/main-vm ubuntu@${IP:-IP_PUBLIQUE}\`
-
-Quota ARM de ce compte : 2 cœurs / 12 Go. Quand il est plein, pense a desactiver ce workflow, et le service sur amd-vm-2 s'arretera de lui-meme."
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "🎉 $NAME obtenue (VM ARM)" --body "$BODY"
           done
 
       - name: Filet de secours - tenter les cibles manquantes
@@ -136,7 +135,6 @@ Quota ARM de ce compte : 2 cœurs / 12 Go. Quand il est plein, pense a desactive
             return 1
           }
 
-          # Rotation : la grosse d'abord, la petite ensuite.
           if ! existe arm-vm-1; then
             if [ "$BUDGET" -ge 2 ]; then
               tenter arm-vm-1 2 12 && exit 0
