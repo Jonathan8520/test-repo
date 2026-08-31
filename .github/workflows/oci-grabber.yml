@@ -146,3 +146,9 @@ jobs:
           else
             echo "Rien a tenter."
           fi
+
+          # Aucune capacite trouvee = situation normale, pas une erreur.
+          # Sans ce exit 0, le job herite du code retour de la derniere tentative
+          # et GitHub marque le run en echec (et envoie un mail) a chaque passage.
+          echo "Fin du run (aucune capacite ARM disponible pour le moment)."
+          exit 0
