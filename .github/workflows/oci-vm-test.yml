@@ -1,0 +1,140 @@
+name: OCI test VM (le bot tournerait-il vraiment ?)
+
+# Verifie SUR LA VM, sans SSH, que le bot de scraping pourrait y tourner.
+# Tout passe par l'agent Oracle (Run Command), comme oci-inspect.
+#
+# Trois sondes, de la moins intrusive a la plus concrete :
+#   1. RECON   - materiel, RAM, swap, disque, services deja actifs (lecture seule)
+#   2. RESEAU  - joignabilite des 5 hotes dont le bot a besoin (x.com, discord,
+#                puter, pypi, twimg). Lecture seule.
+#   3. DEPS    - cree un venv jetable dans /tmp, installe twikit + httpx + Pillow,
+#                importe twikit, mesure la RAM consommee. Ecrit uniquement dans
+#                /tmp/monitor-test (efface au reboot, ou par la sonde CLEANUP).
+#
+# AUCUN secret du bot (cookies X, webhook Discord) n'est transmis ici : cette
+# passe ne teste que l'environnement. La recherche X reelle est une etape a part.
+#
+# ATTENTION MAINTENANCE : jamais de ligne en colonne 0 dans un bloc "run: |".
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_name:
+        description: "Nom de l'instance a tester"
+        required: true
+        default: "amd-vm"
+      probe:
+        description: "Sonde a executer"
+        required: true
+        default: "all"
+        type: choice
+        options: [all, recon, reseau, deps, cleanup]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
+      COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
+      NAME:                ${{ github.event.inputs.instance_name }}
+      PROBE:               ${{ github.event.inputs.probe }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Resoudre l'instance et activer l'agent
+        run: |
+          set +e
+          ID=$(oci compute instance list -c "$COMPARTMENT" --all \
+            --query "data[?\"display-name\"=='$NAME' && \"lifecycle-state\"=='RUNNING'].id | [0]" \
+            --raw-output 2>/dev/null)
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+            echo "❌ Instance '$NAME' introuvable ou pas RUNNING."
+            exit 1
+          fi
+          echo "Instance $NAME : $ID"
+          echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"
+
+          AGENT=$(jq -nc '{areAllPluginsDisabled:false, isManagementDisabled:false, isMonitoringDisabled:false, pluginsConfig:[{name:"Compute Instance Run Command", desiredState:"ENABLED"}]}')
+          oci compute instance update --instance-id "$ID" \
+            --agent-config "$AGENT" --force \
+            --query 'data."agent-config"."plugins-config"' --output json 2>&1 | head -20
+          echo "Attente de la prise en compte par l'agent (90 s)…"
+          sleep 90
+
+      - name: Sondes
+        run: |
+          set +e
+
+          # Envoie un script a l'agent, attend le resultat, l'affiche.
+          # $1 = libelle, $2 = timeout VM (s), $3 = script
+          runcmd() {
+            local LABEL="$1" TMO="$2" SCRIPT="$3" CONTENT TARGET OUT CMD_ID RES STATE i
+            echo "═══════════════════════════════════════════"
+            echo "  SONDE : $LABEL"
+            echo "═══════════════════════════════════════════"
+            CONTENT=$(jq -nc --arg t "$SCRIPT" '{source:{sourceType:"TEXT",text:$t},output:{outputType:"TEXT"}}')
+            TARGET=$(jq -nc --arg i "$INSTANCE_ID" '{instanceId:$i}')
+            OUT=$(oci instance-agent command create \
+              --compartment-id "$COMPARTMENT" \
+              --timeout-in-seconds "$TMO" \
+              --target "$TARGET" --content "$CONTENT" 2>&1)
+            CMD_ID=$(echo "$OUT" | jq -r '.data.id // empty' 2>/dev/null)
+            if [ -z "$CMD_ID" ]; then
+              echo "❌ Creation de commande impossible :"
+              echo "$OUT" | head -20
+              return 1
+            fi
+
+            local MAX=$(( TMO / 10 + 12 ))
+            for i in $(seq 1 $MAX); do
+              RES=$(oci instance-agent command-execution get \
+                --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                --output json 2>&1)
+              STATE=$(echo "$RES" | jq -r '.data."lifecycle-state" // empty' 2>/dev/null)
+              case "$STATE" in
+                SUCCEEDED|FAILED|TIMED_OUT|CANCELED)
+                  echo "etat final : $STATE"
+                  echo "--- sortie VM ---"
+                  echo "$RES" | jq -r '.data.content.output.message // .data.content.output.text // "(sortie vide)"' 2>/dev/null
+                  echo "--- fin ---"
+                  return 0 ;;
+              esac
+              sleep 10
+            done
+            echo "⏱️  Toujours '$STATE' apres $((MAX*10))s."
+            echo "=> L'agent Run Command ne consomme pas la commande sur cette VM."
+            return 1
+          }
+
+          # ---------- 1. RECON ----------
+          if [ "$PROBE" = "all" ] || [ "$PROBE" = "recon" ]; then
+            S='echo "== OS ==" ; . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" ; uname -m ; echo ; echo "== Uptime ==" ; uptime ; echo ; echo "== RAM / SWAP ==" ; free -m ; echo ; echo "== Disque ==" ; df -h / | tail -1 ; echo ; echo "== Charge CPU ==" ; top -bn1 | head -3 ; echo ; echo "== Services actifs (hors systeme) ==" ; systemctl list-units --type=service --state=running --no-pager --no-legend | grep -viE "systemd|dbus|cron|rsyslog|snapd|polkit|udev|getty|unattended|multipathd|irqbalance|chrony|oracle-cloud|iscsi" | head -20 ; echo ; echo "== Grabber present ? ==" ; systemctl is-active oci-grabber 2>/dev/null || echo "oci-grabber : absent" ; echo ; echo "== Python ==" ; python3 --version ; echo ; echo "== Tesseract ==" ; (tesseract --version 2>&1 | head -1) || echo "tesseract : absent"'
+            runcmd "1/3 RECON (lecture seule)" 120 "$S"
+          fi
+
+          # ---------- 2. RESEAU ----------
+          if [ "$PROBE" = "all" ] || [ "$PROBE" = "reseau" ]; then
+            S='echo "Test de sortie vers les hotes dont le bot depend." ; echo "(code HTTP = joignable ; 000 = bloque/timeout)" ; echo ; for H in https://x.com/robots.txt https://api.x.com https://pbs.twimg.com https://discord.com/api/v10/gateway https://api.puter.com https://pypi.org/simple/ ; do C=$(curl -s -o /dev/null -w "%{http_code}" -m 15 "$H" 2>/dev/null) ; T=$(curl -s -o /dev/null -w "%{time_total}" -m 15 "$H" 2>/dev/null) ; printf "  %-45s HTTP %s   (%ss)\n" "$H" "$C" "$T" ; done ; echo ; echo "== IP publique vue de l exterieur ==" ; curl -s -m 15 https://api.ipify.org 2>/dev/null || echo "(injoignable)" ; echo ; echo ; echo "== DNS ==" ; getent hosts x.com || echo "resolution x.com KO"'
+            runcmd "2/3 RESEAU (lecture seule)" 180 "$S"
+          fi
+
+          # ---------- 3. DEPS ----------
+          if [ "$PROBE" = "all" ] || [ "$PROBE" = "deps" ]; then
+            S='D=/tmp/monitor-test ; mkdir -p $D ; cd $D ; echo "== RAM avant ==" ; free -m | head -2 ; echo ; echo "== Prerequis ==" ; command -v git >/dev/null || { echo "git absent -> installation" ; DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 ; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null 2>&1 ; } ; echo "git : $(git --version 2>&1 | head -1)" ; echo ; echo "== Creation du venv ==" ; if ! python3 -m venv venv >/tmp/venv.log 2>&1 ; then echo "venv KO -> installation de python3-venv" ; DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 ; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv >/dev/null 2>&1 ; python3 -m venv venv >/tmp/venv.log 2>&1 || { echo "venv toujours KO :" ; tail -5 /tmp/venv.log ; exit 1 ; } ; fi ; echo "venv OK" ; ./venv/bin/pip install -q --upgrade pip 2>&1 | tail -2 ; echo ; echo "== Installation des deps du bot ==" ; T0=$(date +%s) ; ./venv/bin/pip install -q httpx Pillow python-dotenv "twikit @ git+https://codeberg.org/phin/twikit" 2>&1 | tail -15 ; RC=$? ; T1=$(date +%s) ; echo "pip exit=$RC en $((T1-T0)) s" ; echo ; echo "== Import reel ==" ; ./venv/bin/python -c "import twikit, httpx, PIL, dotenv; print(\"twikit\", getattr(twikit, \"__version__\", \"?\")); print(\"httpx\", httpx.__version__); print(\"Pillow\", PIL.__version__); print(\"imports OK\")" ; echo ; echo "== Empreinte memoire d un client twikit ==" ; ./venv/bin/python -c "import resource, twikit; c = twikit.Client(\"fr-FR\"); print(\"RSS apres init client :\", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024, \"Mo\")" ; echo ; echo "== RAM apres ==" ; free -m | head -2 ; echo ; echo "== Place prise ==" ; du -sh $D'
+            runcmd "3/3 DEPS (ecrit dans /tmp/monitor-test)" 600 "$S"
+          fi
+
+          # ---------- CLEANUP ----------
+          if [ "$PROBE" = "cleanup" ]; then
+            S='rm -rf /tmp/monitor-test && echo "/tmp/monitor-test supprime." ; df -h / | tail -1'
+            runcmd "CLEANUP" 120 "$S"
+          fi
