@@ -17,6 +17,12 @@ name: OCI test VM (le bot tournerait-il vraiment ?)
 # ATTENTION MAINTENANCE : jamais de ligne en colonne 0 dans un bloc "run: |".
 
 on:
+  # Un workflow n'est dispatchable que si son fichier est sur la branche par
+  # defaut. Celui-ci vit sur la branche de migration : le declencheur push
+  # (limite a cette branche) permet de le lancer sans rien poser sur main.
+  push:
+    branches: [claude/oci-scraping-bot-migration-xuh9d1]
+    paths: ['.github/workflows/oci-vm-test.yml']
   workflow_dispatch:
     inputs:
       instance_name:
@@ -44,8 +50,9 @@ jobs:
       OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
       OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
       COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
-      NAME:                ${{ github.event.inputs.instance_name }}
-      PROBE:               ${{ github.event.inputs.probe }}
+      # Sur un declenchement push, les inputs sont vides : on retombe sur les defauts.
+      NAME:                ${{ github.event.inputs.instance_name || 'amd-vm' }}
+      PROBE:               ${{ github.event.inputs.probe || 'all' }}
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
