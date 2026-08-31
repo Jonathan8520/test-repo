@@ -91,8 +91,11 @@ titre "2/5  RESEAU SORTANT"
 echo "  IP publique vue de l'exterieur : $(curl -s -m 15 https://api.ipify.org 2>/dev/null || echo '(injoignable)')"
 echo
 NET_KO=0
+# codeberg.org sert twikit (installe par git+https) : sans lui, l'installation
+# du bot echoue, meme si tout le reste repond.
 for H in https://x.com/robots.txt https://api.x.com https://pbs.twimg.com \
-         https://discord.com/api/v10/gateway https://api.puter.com https://pypi.org/simple/; do
+         https://discord.com/api/v10/gateway https://api.puter.com \
+         https://pypi.org/simple/ https://codeberg.org/phin/twikit; do
   C=$(curl -s -o /dev/null -w "%{http_code}" -m 20 "$H" 2>/dev/null)
   T=$(curl -s -o /dev/null -w "%{time_total}" -m 20 "$H" 2>/dev/null)
   if [ "$C" = "000" ]; then
