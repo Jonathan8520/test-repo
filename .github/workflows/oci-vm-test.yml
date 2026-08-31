@@ -32,9 +32,9 @@ on:
       probe:
         description: "Sonde a executer"
         required: true
-        default: "all"
+        default: "cles"
         type: choice
-        options: [all, recon, reseau, deps, cleanup]
+        options: [cles, all, recon, reseau, deps, cleanup]
 
 permissions:
   contents: read
@@ -52,12 +52,36 @@ jobs:
       COMPARTMENT:         ${{ secrets.OCI_COMPARTMENT }}
       # Sur un declenchement push, les inputs sont vides : on retombe sur les defauts.
       NAME:                ${{ github.event.inputs.instance_name || 'amd-vm' }}
-      PROBE:               ${{ github.event.inputs.probe || 'all' }}
+      PROBE:               ${{ github.event.inputs.probe || 'cles' }}
     steps:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
+      # Lecture seule, sans agent ni SSH : quelle cle publique est reellement
+      # autorisee sur chaque VM. Sert a confirmer qu'une cle privee en main est
+      # bien la bonne, en comparant les empreintes.
+      - name: Cles publiques autorisees sur les VM
+        run: |
+          set +e
+          for N in amd-vm amd-vm-2; do
+            ID=$(oci compute instance list -c "$COMPARTMENT" --all \
+              --query "data[?\"display-name\"=='$N' && \"lifecycle-state\"=='RUNNING'].id | [0]" \
+              --raw-output 2>/dev/null)
+            [ -z "$ID" ] || [ "$ID" = "null" ] && { echo "$N : introuvable"; continue; }
+            K=$(oci compute instance get --instance-id "$ID" \
+              --query 'data.metadata."ssh_authorized_keys"' --raw-output 2>/dev/null)
+            echo "=== $N ==="
+            # ssh-keygen -lf est l'outil canonique et est present sur les runners.
+            printf '%s\n' "$K" | grep -v '^[[:space:]]*$' | while read -r LIGNE; do
+              [ -z "$(echo "$LIGNE" | awk '{print $2}')" ] && continue
+              printf '%s\n' "$LIGNE" > /tmp/k.pub
+              ssh-keygen -lf /tmp/k.pub 2>/dev/null | sed 's/^/  /' \
+                || echo "  (cle illisible) $(echo "$LIGNE" | cut -c1-40)…"
+            done
+          done
+
       - name: Resoudre l'instance et activer l'agent
+        if: ${{ (github.event.inputs.probe || 'cles') != 'cles' }}
         run: |
           set +e
           ID=$(oci compute instance list -c "$COMPARTMENT" --all \
@@ -78,6 +102,7 @@ jobs:
           sleep 90
 
       - name: Sondes
+        if: ${{ (github.event.inputs.probe || 'cles') != 'cles' }}
         run: |
           set +e
 
